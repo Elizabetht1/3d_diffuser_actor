@@ -1,0 +1,4 @@
+[submodule "lpwm-dev"]
+	path = lpwm_dev
+	url = https://github.com/taldatech/lpwm-dev
+	branch = action-reward-gen
