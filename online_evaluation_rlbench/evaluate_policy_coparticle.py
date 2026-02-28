@@ -20,6 +20,7 @@ from pyrep.errors import ConfigurationPathError, IKError
 from rlbench.backend.exceptions import InvalidActionError
 from rlbench.observation_config import ObservationConfig
 from pyrep.const import RenderMode
+from datetime import datetime
 
 # REPLACED: DiffuserActor and Act3D imports removed.
 # Those models conditioned on 3D scene tokens built from point clouds.
@@ -313,6 +314,7 @@ def save_episode_visualizations(
     gt_frames_cam0: np.ndarray,
     gt_frames_cam1: Optional[np.ndarray],
     imagined_traj: Optional[torch.Tensor],
+    obs_history: np.ndarray,
     executed_steps: int,
     task_str: str,
     demo_id: int,
@@ -348,11 +350,11 @@ def save_episode_visualizations(
         return
 
     gt_traj = gt_frames_cam0[:max_ts]
-    pred_traj = gt_traj  # placeholder until rec layout is confirmed
+    pred_traj = obs_history[:max_ts]  # placeholder until rec layout is confirmed
 
     # TODO: Confirm rec shape and adjust indexing/transposing accordingly.
     # TODO: Handle second camera view — conditionally pass if len(camera_names) >= 2.
-    gif_path = output_dir / f"{act_id}.gif"
+    gif_path = os.path.join(output_dir, f"{act_id}.gif")
     
     animate_trajectories(
         orig_trajectory=_normalize_01(gt_traj),
@@ -389,7 +391,7 @@ def _run_step_loop(
     chunk_size: int,
     action_dim: int,
     verbose: bool,
-) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor]]:
+) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor],np.ndarray]:
     """Execute the continuous timestep-by-timestep rollout loop.
 
     # REPLACED: keypose-based trajectory execution removed.
@@ -401,10 +403,12 @@ def _run_step_loop(
         max_reward: highest reward seen across all steps.
         executed_steps: total number of env steps taken.
         actions_history: (max_steps, action_dim) all predicted actions.
+        obs_history: (n_views, max_steps, C,H,W) all observed images.
         last_rec: imagined frames from the final model query, or None.
     """
     obs = initial_obs
     actions_history = np.zeros((max_steps, action_dim))
+    obs_history = np.zeros((max_steps, *obs.front_rgb.shape))
     max_reward = 0.0
     last_rec: Optional[torch.Tensor] = None
     action_chunk: Optional[torch.Tensor] = None
@@ -414,7 +418,8 @@ def _run_step_loop(
     for step_id in range(max_steps):
         rgb = extract_rgb_tensor(obs, camera_names, device)
         obs_buffer = update_obs_buffer(obs_buffer, rgb)
-
+        
+        
         if chunk_cursor >= chunk_size:
             last_rec, action_chunk = query_model(
                 model, obs_buffer, action_buffer,
@@ -427,7 +432,11 @@ def _run_step_loop(
         chunk_cursor += 1
 
         action_buffer = update_action_buffer(action_buffer, action)
+        
+        # update histories         
         actions_history[step_id] = action.cpu().numpy()
+        obs_history[step_id] = rgb.squeeze().permute(1,2,0).cpu().numpy() # output of predict is (C,H,W), reshape to (H,W,C)
+        
 
         action_np = action.cpu().numpy().copy()
         action_np[-1] = round(action_np[-1])  # binarise gripper open/close
@@ -443,8 +452,9 @@ def _run_step_loop(
             print(f"  step {step_id}  reward={reward:.2f}")
         if reward == 1.0 or terminate:
             break
-
-    return max_reward, step_id + 1, actions_history, last_rec
+    
+    breakpoint()
+    return max_reward, step_id + 1, actions_history, last_rec, obs_history
 
 
 @torch.no_grad()
@@ -458,6 +468,7 @@ def run_episode(
     language_goal: Optional[torch.Tensor],
     args: Arguments,
     device: torch.device,
+    output_dir: Optional[str]
 ) -> float:
     """Set up and run one demo episode; return the max reward achieved.
 
@@ -485,7 +496,7 @@ def run_episode(
     action_buffer = init_action_buffer(args.cond_steps, args.action_dim, device)
 
     
-    max_reward, executed_steps, actions_history, last_rec = _run_step_loop(
+    max_reward, executed_steps, actions_history, last_rec, obs_history = _run_step_loop(
         task=task, mover=mover, initial_obs=obs,
         obs_buffer=obs_buffer, action_buffer=action_buffer,
         model=model, language_goal=language_goal, goal_tensor=goal_tensor,
@@ -499,10 +510,10 @@ def run_episode(
     save_episode_visualizations(
         model=model, actions_history=actions_history,
         gt_actions=gt_actions, gt_frames_cam0=gt_frames_cam0,
-        gt_frames_cam1=gt_frames_cam1, imagined_traj=last_rec,
+        gt_frames_cam1=gt_frames_cam1, imagined_traj=last_rec, obs_history = obs_history,
         executed_steps=executed_steps, task_str=task_str,
         demo_id=demo_id, cond_steps=args.cond_steps,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         gif_fps=args.gif_fps,
     )
     return max_reward
@@ -517,6 +528,7 @@ def evaluate_one_variation(
     language_goal: Optional[torch.Tensor],
     args: Arguments,
     device: torch.device,
+    output_dir: Optional[str]
 ) -> Tuple[float, int]:
     """Evaluate num_episodes demos for one task variation.
 
@@ -533,6 +545,7 @@ def evaluate_one_variation(
         max_reward = run_episode(
             env, task, task_str, variation, demo_id,
             model, language_goal, args, device,
+            output_dir
         )
         num_valid += 1
         # except Exception as exc:
@@ -571,6 +584,7 @@ def evaluate_task(
     language_goal: Optional[torch.Tensor],
     args: Arguments,
     device: torch.device,
+    output_dir: Optional[str]
 ) -> Dict:
     """Evaluate across all requested variations of one task.
 
@@ -589,7 +603,7 @@ def evaluate_task(
 
     for variation in variations:
         total_success, num_valid = evaluate_one_variation(
-            env, task_str, variation, task, model, language_goal, args, device,
+            env, task_str, variation, task, model, language_goal, args, device, output_dir=output_dir
         )
         if num_valid > 0:
             var_successes[variation] = total_success / num_valid
@@ -611,7 +625,8 @@ def main() -> None:
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = os.path.join(args.output_dir,f"run_{datetime.now().strftime('%d.%b.%Y_%I:%M')}")
+    os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
 
     device = torch.device(args.device)
@@ -648,12 +663,12 @@ def main() -> None:
         if args.max_steps == -1:
             args.max_steps = max_eps_dict.get(task_str, 25)
 
-        result = evaluate_task(env, task_str, model, language_goal, args, device)
+        result = evaluate_task(env, task_str, model, language_goal, args, device,output_dir = output_dir)
         print(f"\n{task_str} per-variation SR: {round_floats(result)}")
         print(f"{task_str} mean SR: {round_floats(result['mean'])}")
 
         task_success_rates[task_str] = result
-        with open(args.output_file, "w") as f:
+        with open(os.path.join(output_dir,'eval.json'), "w") as f:
             json.dump(round_floats(task_success_rates), f, indent=4)
 
 
