@@ -44,9 +44,15 @@ from utils.utils_with_rlbench import (
 # point-cloud tensors and 3D trajectory denoising. Inference is now
 # handled by query_model() via model.sample_from_x().
 
+# @TODO add convert to 6D 
+# @TODO add support for existing datasets 
+# @TODO figure out language conditioning crash
+
 from lpwm_dev.model_factory import build_model  # type: ignore  # black-box; not implemented here
 from lpwm_dev.rlbench_utils.action_reconstructions import plot_actions
 from lpwm_dev.utils.util_func import animate_trajectories  # type: ignore
+from lpwm_dev.rlbench_utils.geometry import action_xyzw_to_ortho6d, action_ortho6d_to_xyzw
+from transformers import T5Tokenizer, T5EncoderModel
 
 def load_model(config_fp, weights_fp):
     model = build_model(config_fp)
@@ -59,6 +65,7 @@ class Arguments(tap.Tap):
     # Required
     config_path: Path
     weights_path: Path
+    
 
     # RLBench simulation
     data_dir: Path = Path(__file__).parent / "demos"
@@ -68,9 +75,9 @@ class Arguments(tap.Tap):
     max_steps: int = 25
     max_tries: int = 10
     cameras: Tuple[str, ...] = ("left_shoulder", "right_shoulder", "wrist")
-    image_size: str = "64,64"
     headless: int = 1
     collision_checking: int = 0
+    image_size: str = "128,128"
 
     # Model inference
     num_steps: int = 50    # diffusion denoising steps per query
@@ -78,6 +85,7 @@ class Arguments(tap.Tap):
     chunk_size: int = 8    # actions per chunk before re-querying the model
     action_dim: int = 8    # dimensionality of each action vector
     gif_fps: float = 10.0   # frame rate for saved GIF animations
+    convert_to_6D: int = 0
 
     # Outputs
     seed: int = 2
@@ -85,6 +93,8 @@ class Arguments(tap.Tap):
     output_file: Path = Path(__file__).parent / "eval.json"
     output_dir: Path = Path(__file__).parent / "eval_outputs"
     verbose: int = 0
+    
+    
 
 
 def build_rlbench_env(args: Arguments) -> RLBenchEnv:
@@ -215,6 +225,7 @@ def query_model(
     language_goal: Optional[torch.Tensor],
     num_steps: int,
     cond_steps: int,
+    convert_to_6D: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Query the RGB diffusion model for the next action chunk.
 
@@ -236,20 +247,29 @@ def query_model(
         action_chunk: predicted actions of shape (1, chunk_size, action_dim).
     """
     # TODO: Confirm rec shape and adjust indexing/transposing accordingly.
-    _, _, c, h, w = obs_buffer.shape
+    b, t, c, h, w = obs_buffer.shape
+    
+    assert h == model.image_size and w == model.image_size, "inconsistent image sizes, please specifcy image size via command line"
+    
     if goal_tensor is None and model.img_goal_condition:
         print("[WARNING] introducing dummy image conditioning data.\n")
-        goal_tensor = torch.zeros(1,c,h,w).to(obs_buffer.device)
+        goal_tensor = torch.zeros(b,c,h,w).to(obs_buffer.device)
         
        
     if language_goal is None and model.language_condition:
         print("[WARNING] introducing dummy language conditioning data.\n")
-        language_goal = torch.zeros(1,model.language_max_len, model.language_embed_dim).to(obs_buffer.device)
+        language_goal = torch.ones(1,model.language_max_len, model.language_embed_dim).to(obs_buffer.device)
        
     
     # unsqueeze actions to match dimensions expected
     action_buffer = action_buffer.unsqueeze(0) # [B,cond_steps, action_dim]
-
+    if convert_to_6D:
+        action_buffer = action_xyzw_to_ortho6d(action_buffer)
+    
+    assert model.n_views * action_buffer.shape[0] == obs_buffer.shape[0], "actions and observations have same batch size"
+    assert action_buffer.shape[1] == obs_buffer.shape[1], "actions and observations have same time steps"
+    assert not action_buffer.isnan().any()
+    assert not obs_buffer.isnan().any()
     rec, action_chunk, _, _ = model.sample_from_x(
         x=obs_buffer,
         num_steps=num_steps,
@@ -263,6 +283,8 @@ def query_model(
         lang_embed=language_goal,
         n_pred_eq_gt = False
     )
+    if convert_to_6D:
+        action_chunk = action_ortho6d_to_xyzw(action_chunk)
     return rec, action_chunk
 
 
@@ -321,6 +343,7 @@ def save_episode_visualizations(
     cond_steps: int,
     output_dir: Path,
     gif_fps: float,
+    variation : int
 ) -> None:
     """Save action comparison plots and trajectory animations for one episode.
 
@@ -343,7 +366,7 @@ def save_episode_visualizations(
         timestep_horizon=max_ts,
         id=act_id,
         root=output_dir,
-        ndim=model.action_dim,
+        ndim=actions_history.shape[-1], 
     )
 
     if imagined_traj is None:
@@ -354,12 +377,13 @@ def save_episode_visualizations(
 
     # TODO: Confirm rec shape and adjust indexing/transposing accordingly.
     # TODO: Handle second camera view — conditionally pass if len(camera_names) >= 2.
-    gif_path = os.path.join(output_dir, f"{act_id}.gif")
+    gif_path = os.path.join(output_dir, f"{act_id}_var_{variation}_demo_{demo_id}.gif")
     
+    # @TODO integrate multiview
     animate_trajectories(
         orig_trajectory=_normalize_01(gt_traj),
-        pred_trajectory=_normalize_01(pred_traj),
-        pred_trajectory_2=imagined_traj[0, :max_ts].permute(0,2,3,1).detach().cpu().numpy(),
+        pred_trajectory=_normalize_01(pred_traj[0]),
+        pred_trajectory_2=_normalize_01(imagined_traj[0, :max_ts].permute(0,2,3,1).detach().cpu().numpy()),
         pred_trajectory_22=None, # imagined_traj[1, :max_ts].permute(0,2,3,1)
         path=gif_path,
         duration=gif_fps,
@@ -368,7 +392,7 @@ def save_episode_visualizations(
         t2="-S",
         title=f"GT vs Predicted - {act_id}",
         goal_img=None,
-        orig_trajectory2=gt_frames_cam1[:max_ts] if gt_frames_cam1 is not None else None,
+        orig_trajectory2=None, # gt_frames_cam1[:max_ts] if gt_frames_cam1 is not None else None
         pred_trajectory_12=None,
         goal_img2=None,
     )
@@ -391,6 +415,7 @@ def _run_step_loop(
     chunk_size: int,
     action_dim: int,
     verbose: bool,
+    convert_to_6D: bool
 ) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor],np.ndarray]:
     """Execute the continuous timestep-by-timestep rollout loop.
 
@@ -408,7 +433,7 @@ def _run_step_loop(
     """
     obs = initial_obs
     actions_history = np.zeros((max_steps, action_dim))
-    obs_history = np.zeros((max_steps, *obs.front_rgb.shape))
+    obs_history = np.zeros((model.n_views,max_steps, *obs.front_rgb.shape))
     max_reward = 0.0
     last_rec: Optional[torch.Tensor] = None
     action_chunk: Optional[torch.Tensor] = None
@@ -424,6 +449,7 @@ def _run_step_loop(
             last_rec, action_chunk = query_model(
                 model, obs_buffer, action_buffer,
                 goal_tensor, language_goal, num_steps, cond_steps,
+                convert_to_6D
             )
             chunk_cursor = 0
 
@@ -435,8 +461,9 @@ def _run_step_loop(
         
         # update histories         
         actions_history[step_id] = action.cpu().numpy()
-        obs_history[step_id] = rgb.squeeze().permute(1,2,0).cpu().numpy() # output of predict is (C,H,W), reshape to (H,W,C)
-        
+        for view in range(model.n_views):
+            obs_history[view,step_id] = rgb[view].squeeze().permute(1,2,0).cpu().numpy() # output of predict is (C,H,W), reshape to (H,W,C)
+        # @TODO 2x check for backward compatibility with single view
 
         action_np = action.cpu().numpy().copy()
         action_np[-1] = round(action_np[-1])  # binarise gripper open/close
@@ -453,7 +480,6 @@ def _run_step_loop(
         if reward == 1.0 or terminate:
             break
     
-    breakpoint()
     return max_reward, step_id + 1, actions_history, last_rec, obs_history
 
 
@@ -468,7 +494,8 @@ def run_episode(
     language_goal: Optional[torch.Tensor],
     args: Arguments,
     device: torch.device,
-    output_dir: Optional[str]
+    output_dir: Optional[str],
+    variation_num:int 
 ) -> float:
     """Set up and run one demo episode; return the max reward achieved.
 
@@ -485,15 +512,34 @@ def run_episode(
 
     # TODO: Define language embedding source. Replace `language_goal` with either
     # a call to an encoder or a lookup from precomputed embeddings.
+    
+   
 
-    _, obs = task.reset_to_demo(demo)
+   
+                
+    descriptions, obs = task.reset_to_demo(demo)
     mover = Mover(task, max_tries=args.max_tries)
+    
+    
+    if model.language_condition:
+        tokenizer = T5Tokenizer.from_pretrained('t5-large')
+        encoder = T5EncoderModel.from_pretrained('t5-large')
+        encoder.eval()  # Set to evaluation mode
+        desc = descriptions[np.random.randint(len(descriptions))]
+        tokenized_desc = tokenizer(desc, max_length=model.language_max_len, padding='max_length', truncation=True, return_tensors='pt')
+        tokenized_desc=  tokenized_desc['input_ids']  # Return a 1D tensor
+        language_goal = encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(device)
+    else:
+        language_goal = None
+   
     
 
 
     first_rgb = extract_rgb_tensor(obs, args.cameras, device)
     obs_buffer = init_obs_buffer(first_rgb, args.cond_steps)
-    action_buffer = init_action_buffer(args.cond_steps, args.action_dim, device)
+
+    # action_buffer = init_action_buffer(args.cond_steps, args.action_dim, device)
+    action_buffer = torch.tensor(gt_actions[0]).unsqueeze(0).float().to(device)
 
     
     max_reward, executed_steps, actions_history, last_rec, obs_history = _run_step_loop(
@@ -504,6 +550,7 @@ def run_episode(
         max_steps=args.max_steps, num_steps=args.num_steps,
         cond_steps=args.cond_steps, chunk_size=args.chunk_size,
         action_dim=args.action_dim, verbose=bool(args.verbose),
+        convert_to_6D=bool(args.convert_to_6D)
     )
 
    
@@ -515,6 +562,7 @@ def run_episode(
         demo_id=demo_id, cond_steps=args.cond_steps,
         output_dir=output_dir,
         gif_fps=args.gif_fps,
+        variation=variation_num
     )
     return max_reward
 
@@ -541,16 +589,17 @@ def evaluate_one_variation(
     num_valid = 0
 
     for demo_id in range(args.num_episodes):
-        
-        max_reward = run_episode(
-            env, task, task_str, variation, demo_id,
-            model, language_goal, args, device,
-            output_dir
-        )
-        num_valid += 1
-        # except Exception as exc:
-        #     print(f"  demo {demo_id} failed: {exc}")
-        #     continue
+        try:
+            max_reward = run_episode(
+                env, task, task_str, variation, demo_id,
+                model, language_goal, args, device,
+                output_dir,
+                variation_num=variation
+            )
+            num_valid += 1
+        except Exception as exc:
+            print(f"  demo {demo_id} failed: {exc}")
+            continue
 
         if max_reward == 1.0:
             total_success += 1
