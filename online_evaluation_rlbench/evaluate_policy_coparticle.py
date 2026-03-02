@@ -589,17 +589,14 @@ def evaluate_one_variation(
     num_valid = 0
 
     for demo_id in range(args.num_episodes):
-        try:
-            max_reward = run_episode(
-                env, task, task_str, variation, demo_id,
-                model, language_goal, args, device,
-                output_dir,
-                variation_num=variation
-            )
-            num_valid += 1
-        except Exception as exc:
-            print(f"  demo {demo_id} failed: {exc}")
-            continue
+        # try:
+        max_reward = run_episode(
+            env, task, task_str, variation, demo_id,
+            model, language_goal, args, device,
+            output_dir,
+            variation_num=variation
+        )
+        num_valid += 1
 
         if max_reward == 1.0:
             total_success += 1

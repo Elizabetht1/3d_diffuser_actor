@@ -1,8 +1,13 @@
 exp=3d_diffuser_actor
 
-tasks=(
+tasks_old=(
     close_jar insert_onto_square_peg light_bulb_in meat_off_grill open_drawer place_shape_in_shape_sorter place_wine_at_rack_location push_buttons put_groceries_in_cupboard put_item_in_drawer put_money_in_safe reach_and_drag slide_block_to_color_target stack_blocks stack_cups sweep_to_dustpan_of_size turn_tap place_cups
 )
+# test tasks 
+tasks=(
+    meat_off_grill put_groceries_in_cupboard
+)
+
 data_dir=./data/peract/raw/test/
 num_episodes=100
 gripper_loc_bounds_file=tasks/18_peract_tasks_location_bounds.json
@@ -19,10 +24,15 @@ relative_action=0
 seed=0
 checkpoint=train_logs/diffuser_actor_peract.pth
 quaternion_format=wxyz  # IMPORTANT: change this to be the same as the training script IF you're not using our checkpoint
+headless=1 # NEW – attempt render headless
+
+export COPPELIASIM_ROOT=~/Desktop/projects/3d_diffuser_actor/PyRep/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04
+export LD_LIBRARY_PATH=$COPPELIASIM_ROOT:$LD_LIBRARY_PATH
+export QT_QPA_PLATFORM_PLUGIN_PATH=$COPPELIASIM_ROOT
 
 num_ckpts=${#tasks[@]}
 for ((i=0; i<$num_ckpts; i++)); do
-    CUDA_LAUNCH_BLOCKING=1 python online_evaluation_rlbench/evaluate_policy.py \
+    CUDA_LAUNCH_BLOCKING=1 DISPLAY=:99 python -m online_evaluation_rlbench.evaluate_policy \
     --tasks ${tasks[$i]} \
     --checkpoint $checkpoint \
     --diffusion_timesteps 100 \
@@ -52,6 +62,7 @@ for ((i=0; i<$num_ckpts; i++)); do
     --gripper_loc_bounds_buffer 0.04 \
     --quaternion_format $quaternion_format \
     --interpolation_length $interpolation_length \
-    --dense_interpolation 1
+    --dense_interpolation 1 \
+    --headless $headless
 done
 
