@@ -72,7 +72,7 @@ class Arguments(tap.Tap):
     tasks: Optional[Tuple[str, ...]] = None
     variations: Tuple[int, ...] = (1,)
     num_episodes: int = 1
-    max_steps: int = 25
+    max_steps: int = 100
     max_tries: int = 10
     cameras: Tuple[str, ...] = ("left_shoulder", "right_shoulder", "wrist")
     headless: int = 1
@@ -80,7 +80,7 @@ class Arguments(tap.Tap):
     image_size: str = "128,128"
 
     # Model inference
-    num_steps: int = 50    # diffusion denoising steps per query
+    num_steps: int = 10   # diffusion denoising steps per query
     cond_steps: int = 1    # frames of observation history fed to model
     chunk_size: int = 8    # actions per chunk before re-querying the model
     action_dim: int = 8    # dimensionality of each action vector
@@ -197,7 +197,7 @@ def init_action_buffer(
     Returns:
         Zero tensor of shape (cond_steps, action_dim).
     """
-    return torch.zeros(cond_steps, action_dim, device=device)
+    return torch.ones(cond_steps, action_dim, device=device)
 
 
 def update_action_buffer(
@@ -343,7 +343,8 @@ def save_episode_visualizations(
     cond_steps: int,
     output_dir: Path,
     gif_fps: float,
-    variation : int
+    variation : int,
+    language_goal : str
 ) -> None:
     """Save action comparison plots and trajectory animations for one episode.
 
@@ -381,18 +382,18 @@ def save_episode_visualizations(
     
     # @TODO integrate multiview
     animate_trajectories(
-        orig_trajectory=_normalize_01(gt_traj),
-        pred_trajectory=_normalize_01(pred_traj[0]),
-        pred_trajectory_2=_normalize_01(imagined_traj[0, :max_ts].permute(0,2,3,1).detach().cpu().numpy()),
-        pred_trajectory_22=None, # imagined_traj[1, :max_ts].permute(0,2,3,1)
+        orig_trajectory=_normalize_01(gt_traj[:max_ts]),
+        pred_trajectory=_normalize_01(pred_traj[0,:max_ts]),
+        pred_trajectory_2=_normalize_01(imagined_traj[0,:max_ts]),
+        pred_trajectory_22=None, 
         path=gif_path,
         duration=gif_fps,
         rec_to_pred_t=cond_steps,
         t1="-D",
         t2="-S",
-        title=f"GT vs Predicted - {act_id}",
+        title=f"GT vs Predicted - {language_goal}",
         goal_img=None,
-        orig_trajectory2=None, # gt_frames_cam1[:max_ts] if gt_frames_cam1 is not None else None
+        orig_trajectory2=None, 
         pred_trajectory_12=None,
         goal_img2=None,
     )
@@ -416,7 +417,7 @@ def _run_step_loop(
     action_dim: int,
     verbose: bool,
     convert_to_6D: bool
-) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor],np.ndarray]:
+) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor],np.ndarray, np.ndarray]:
     """Execute the continuous timestep-by-timestep rollout loop.
 
     # REPLACED: keypose-based trajectory execution removed.
@@ -434,15 +435,18 @@ def _run_step_loop(
     obs = initial_obs
     actions_history = np.zeros((max_steps, action_dim))
     obs_history = np.zeros((model.n_views,max_steps, *obs.front_rgb.shape))
+    imagination_history = np.zeros((model.n_views,max_steps, *obs.front_rgb.shape))
     max_reward = 0.0
     last_rec: Optional[torch.Tensor] = None
     action_chunk: Optional[torch.Tensor] = None
     chunk_cursor = chunk_size  # trigger a model query on the very first step
-    step_id = -1
+    
+    
+    step_id = 0
 
-    for step_id in range(max_steps):
-        rgb = extract_rgb_tensor(obs, camera_names, device)
-        obs_buffer = update_obs_buffer(obs_buffer, rgb)
+    # @TODO given the initial obs, extract the pose
+    while step_id < max_steps:
+        
         
         
         if chunk_cursor >= chunk_size:
@@ -452,35 +456,67 @@ def _run_step_loop(
                 convert_to_6D
             )
             chunk_cursor = 0
-
-        assert action_chunk is not None
-        action: torch.Tensor = action_chunk[0, chunk_cursor]  # (action_dim,)
-        chunk_cursor += 1
-
-        action_buffer = update_action_buffer(action_buffer, action)
         
-        # update histories         
-        actions_history[step_id] = action.cpu().numpy()
-        for view in range(model.n_views):
-            obs_history[view,step_id] = rgb[view].squeeze().permute(1,2,0).cpu().numpy() # output of predict is (C,H,W), reshape to (H,W,C)
-        # @TODO 2x check for backward compatibility with single view
+       
+            
+        assert action_chunk is not None
+        action_chunk = action_chunk.squeeze() 
+        # @TODO investigate why it returns num_steps + 1 
+        assert action_chunk.shape[0]  == num_steps + 1 and action_chunk.shape[1] == action_dim
+        
+        last_rec = last_rec.permute(1,0,2,3,4) # [Views, T, C, H , W] -> [T, Views, C, H, W]
+        
+        assert last_rec.shape[0] == action_chunk.shape[0] # should be iterating over temporal dimension
+        for rec,action in zip(last_rec,action_chunk):
+            
+           
+            # handle step_id updates in inner loop – may get past loop g
+            if step_id >= max_steps:
+                break
+            
+            # action: torch.Tensor = action_chunk[0, chunk_cursor]  # (action_dim,)
+            chunk_cursor += 1
 
-        action_np = action.cpu().numpy().copy()
-        action_np[-1] = round(action_np[-1])  # binarise gripper open/close
+         
+            
+            
+            # update histories         
+          
+            actions_history[step_id] = action.cpu().numpy()
+            
 
-        try:
-            obs, reward, terminate, _ = mover(action_np)
-        except (IKError, ConfigurationPathError, InvalidActionError) as exc:
-            print(f"  step {step_id} execution error: {exc}")
-            break
+            
+            # @TODO 2x check for backward compatibility with single view
 
-        max_reward = max(max_reward, float(reward))
-        if verbose:
-            print(f"  step {step_id}  reward={reward:.2f}")
-        if reward == 1.0 or terminate:
-            break
+            action_np = action.cpu().numpy().copy()
+            action_np[-1] = round(action_np[-1])  # binarise gripper open/close
+
+            try:
+                obs, reward, terminate, _ = mover(action_np)
+                actual_action = np.concatenate([obs.gripper_pose, [obs.gripper_open]])
+                actual_action_t = torch.tensor(actual_action).float().to(device)
+                action_buffer = update_action_buffer(action_buffer, actual_action_t)
+                rgb = extract_rgb_tensor(obs, camera_names, device)
+                obs_buffer = update_obs_buffer(obs_buffer, rgb)
+                assert rec.shape == rgb.shape
+                for view in range(model.n_views):
+                    obs_history[view,step_id] = rgb[view].squeeze().permute(1,2,0).cpu().numpy() # output of predict is (C,H,W), reshape to (H,W,C)
+                    imagination_history[view,step_id] = rec[view].squeeze().permute(1,2,0).cpu().numpy()
+            
+            
+            except (IKError, ConfigurationPathError, InvalidActionError) as exc:
+                print(f"  step {step_id} execution error: {exc}")
+                break
+
+            max_reward = max(max_reward, float(reward))
+            if verbose:
+                print(f"  step {step_id}  reward={reward:.2f}")
+            if reward == 1.0 or terminate:
+                break
+            # update step id 
+            step_id +=1 
     
-    return max_reward, step_id + 1, actions_history, last_rec, obs_history
+    return max_reward, step_id + 1, actions_history, last_rec, obs_history, imagination_history
 
 
 @torch.no_grad()
@@ -531,7 +567,7 @@ def run_episode(
         language_goal = encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(device)
     else:
         language_goal = None
-   
+    
     
 
 
@@ -540,9 +576,10 @@ def run_episode(
 
     # action_buffer = init_action_buffer(args.cond_steps, args.action_dim, device)
     action_buffer = torch.tensor(gt_actions[0]).unsqueeze(0).float().to(device)
+    # action_buffer = torch.zeros_like(torch.tensor(gt_actions[0]).unsqueeze(0).float().to(device))
 
     
-    max_reward, executed_steps, actions_history, last_rec, obs_history = _run_step_loop(
+    max_reward, executed_steps, actions_history, last_rec, obs_history, imagination_history = _run_step_loop(
         task=task, mover=mover, initial_obs=obs,
         obs_buffer=obs_buffer, action_buffer=action_buffer,
         model=model, language_goal=language_goal, goal_tensor=goal_tensor,
@@ -557,12 +594,13 @@ def run_episode(
     save_episode_visualizations(
         model=model, actions_history=actions_history,
         gt_actions=gt_actions, gt_frames_cam0=gt_frames_cam0,
-        gt_frames_cam1=gt_frames_cam1, imagined_traj=last_rec, obs_history = obs_history,
+        gt_frames_cam1=gt_frames_cam1, imagined_traj=imagination_history, obs_history = obs_history,
         executed_steps=executed_steps, task_str=task_str,
         demo_id=demo_id, cond_steps=args.cond_steps,
         output_dir=output_dir,
         gif_fps=args.gif_fps,
-        variation=variation_num
+        variation=variation_num,
+        language_goal=desc
     )
     return max_reward
 
