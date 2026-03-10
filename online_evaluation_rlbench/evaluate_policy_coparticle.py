@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import torch
+import torchvision.transforms as transforms
 import tap
 from pyrep.errors import ConfigurationPathError, IKError
 from rlbench.backend.exceptions import InvalidActionError
@@ -271,6 +272,20 @@ class Arguments(tap.Tap):
     
 
 
+def build_image_transform(image_size: int):
+    """Build the image preprocessing transform matching training-time preprocessing.
+
+    Uses ToTensor (uint8 -> float [0,1], HWC->CHW) followed by Resize + CenterCrop,
+    matching the transform used in LPWMAgent.  Replaces the per-frame min-max
+    _normalize_01 which produced statistics inconsistent with training.
+    """
+    return transforms.Compose([
+        transforms.ToTensor(),           # HWC uint8 -> CHW float32 in [0, 1]
+        transforms.Resize(image_size, antialias=True),
+        transforms.CenterCrop(image_size),
+    ])
+
+
 def build_rlbench_env(args: Arguments) -> RLBenchEnv:
     """Construct an RLBenchEnv configured for RGB-only observation.
 
@@ -307,13 +322,16 @@ def extract_rgb_tensor(
     obs,
     camera_names: Tuple[str, ...],
     device: torch.device,
+    transform=None,
 ) -> torch.Tensor:
-    """Extract a normalised RGB tensor from one RLBench observation.
+    """Extract a preprocessed RGB tensor from one RLBench observation.
 
     Args:
         obs: RLBench Observation object.
         camera_names: Ordered camera names to extract.
         device: Target device for the output tensor.
+        transform: torchvision transform built by build_image_transform().
+            If None, falls back to a plain /255 normalisation.
 
     Returns:
         Tensor of shape (num_views, 3, H, W) with values in [0, 1].
@@ -321,8 +339,10 @@ def extract_rgb_tensor(
     frames: List[torch.Tensor] = []
     for cam in camera_names:
         rgb_np: np.ndarray = getattr(obs, f"{cam}_rgb")  # (H, W, 3) uint8
-        rgb_np = _normalize_01(rgb_np) # normalize
-        rgb = torch.from_numpy(rgb_np).float().permute(2, 0, 1) 
+        if transform is not None:
+            rgb = transform(rgb_np)  # ToTensor handles HWC->CHW and /255
+        else:
+            rgb = torch.from_numpy(rgb_np.astype(np.float32) / 255.0).permute(2, 0, 1)
         frames.append(rgb)
     return torch.stack(frames).to(device)  # (num_views, 3, H, W)
 
@@ -391,6 +411,24 @@ def update_action_buffer(
     return torch.cat([buffer[1:], new_action.unsqueeze(0)], dim=0)
 
 
+def _pad_obs_to_model_input(obs_buffer: torch.Tensor, num_steps: int) -> torch.Tensor:
+    """Pad a sliding-window obs buffer to the full model input length.
+
+    sample_from_x() expects x of length cond_steps + num_steps.  During rollout
+    we only have cond_steps of real observations, so we repeat the last observed
+    frame for the prediction horizon — identical to LPWMAgent._build_input_frames.
+
+    Args:
+        obs_buffer: (n_views, cond_steps, C, H, W) recent observation history.
+        num_steps: number of future steps the model will predict.
+
+    Returns:
+        Tensor of shape (n_views, cond_steps + num_steps, C, H, W).
+    """
+    last_frame = obs_buffer[:, -1:].expand(-1, num_steps, -1, -1, -1)
+    return torch.cat([obs_buffer, last_frame], dim=1)
+
+
 @torch.no_grad()
 def query_model(
     model,
@@ -404,78 +442,67 @@ def query_model(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Query the RGB diffusion model for the next action chunk.
 
-    # REPLACED: DiffuserActor / Act3D forward pass removed.
-    # Old call: policy(fake_traj, traj_mask, rgbs[:, -1], pcds[:, -1], instr, gripper)
-    # That consumed point-cloud tensors (pcds) and performed 3D trajectory
-    # denoising. New call: model.sample_from_x() with RGB observation buffer only.
-
     Args:
-        obs_buffer: (num_views, cond_steps, C, H, W) normalised RGB history.
+        obs_buffer: (num_views, cond_steps, C, H, W) sliding-window RGB history.
+            Padded internally to cond_steps + num_steps before the model call,
+            matching the LPWMAgent._build_input_frames contract.
         action_buffer: (cond_steps, action_dim) action history context.
-        goal_tensor: optional (C, H, W) RGB goal frame.
-        language_goal: optional (max_len, embed_dim) pre-embedded language.
-        num_steps: diffusion denoising steps per call.
+        goal_tensor: optional goal RGB frame.
+        language_goal: optional pre-embedded language tensor.
+        num_steps: prediction horizon (future steps to generate).
         cond_steps: context window length expected by the model.
 
     Returns:
-        rec: imagined future RGB frames (shape TBD — see TODO).
-        action_chunk: predicted actions of shape (1, chunk_size, action_dim).
+        rec: imagined future RGB frames, shape (num_views, cond_steps+num_steps, C, H, W).
+        action_chunk: predicted actions of shape (num_steps, action_dim),
+            with context reconstruction steps already stripped.
     """
-    # TODO: Confirm rec shape and adjust indexing/transposing accordingly.
-    b, t, c, h, w = obs_buffer.shape
-    
-    assert h == model.image_size and w == model.image_size, "inconsistent image sizes, please specifcy image size via command line"
-    
+    b, _t, c, h, w = obs_buffer.shape  # b = n_views for bs=1
+
+    assert h == model.image_size and w == model.image_size, (
+        f"Image size mismatch: obs {h}x{w} vs model {model.image_size}x{model.image_size}. "
+        "Set --image_size accordingly."
+    )
+
+    # Pad obs to cond_steps + num_steps by repeating the last frame.
+    obs_input = _pad_obs_to_model_input(obs_buffer, num_steps)
+
     if goal_tensor is None and model.img_goal_condition:
         print("[WARNING] introducing dummy image conditioning data.\n")
-        goal_tensor = torch.zeros(b,c,h,w).to(obs_buffer.device)
-        
-       
+        goal_tensor = torch.zeros(b, c, h, w).to(obs_buffer.device)
+
     if language_goal is None and model.language_condition:
         print("[WARNING] introducing dummy language conditioning data.\n")
-        language_goal = torch.ones(1,model.language_max_len, model.language_embed_dim).to(obs_buffer.device)
-       
-    
-    # unsqueeze actions to match dimensions expected
-    action_buffer = action_buffer.unsqueeze(0) # [B,cond_steps, action_dim]
+        language_goal = torch.ones(1, model.language_max_len, model.language_embed_dim).to(obs_buffer.device)
+
+    # action_buffer: (cond_steps, action_dim) -> (1, cond_steps, action_dim)
+    action_buffer = action_buffer.unsqueeze(0)
     if convert_to_6D:
         action_buffer = action_xyzw_to_ortho6d(action_buffer)
-    
-    
-    assert model.n_views * action_buffer.shape[0] == obs_buffer.shape[0], "actions and observations have same batch size"
-    assert action_buffer.shape[1] == obs_buffer.shape[1], "actions and observations have same time steps"
+
     assert not action_buffer.isnan().any()
-    assert not obs_buffer.isnan().any()
+    assert not obs_input.isnan().any()
     assert language_goal is not None
     language_goal = language_goal.unsqueeze(0)
 
-    # rec, action_chunk, _, _ = model.sample_from_x_eval(
-    #     x=obs_buffer,
-    #     num_steps=num_steps,
-    #     # cond_steps=cond_steps,
-    #     deterministic=False,
-    #     x_goal=goal_tensor,
-    #     decode=True,
-    #     return_context_posterior=True,
-    #     return_aux_rec=True,
-    #     actions=action_buffer,
-    #     lang_embed=language_goal,
-    #     # n_pred_eq_gt = False,
-    #     pred_cond_steps=1
-    # )
     rec, action_chunk, _, _ = model.sample_from_x(
-        x=obs_buffer,
+        x=obs_input,
         num_steps=num_steps,
         cond_steps=cond_steps,
         deterministic=False,
         x_goal=goal_tensor,
         decode=True,
-        return_context_posterior=True,
         return_aux_rec=True,
         actions=action_buffer,
         lang_embed=language_goal,
-        n_pred_eq_gt = False,
+        n_pred_eq_gt=False,
     )
+
+    # Strip context reconstruction steps; keep only predicted actions.
+    # action_chunk shape from model: (1, cond_steps + num_steps, action_dim)
+    action_chunk = action_chunk[:, cond_steps:cond_steps + num_steps]  # (1, num_steps, action_dim)
+    action_chunk = action_chunk.squeeze(0)  # (num_steps, action_dim)
+
     if convert_to_6D:
         action_chunk = action_ortho6d_to_xyzw(action_chunk)
     return rec, action_chunk
@@ -596,8 +623,6 @@ def _run_step_loop(
     task,
     mover: Mover,
     initial_obs,
-    # obs_buffer: torch.Tensor,
-    # action_buffer: torch.Tensor,
     model,
     language_goal: Optional[torch.Tensor],
     goal_tensor: Optional[torch.Tensor],
@@ -611,140 +636,121 @@ def _run_step_loop(
     verbose: bool,
     convert_to_6D: bool,
     output_dir: str,
-) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor],np.ndarray, np.ndarray]:
+) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor], np.ndarray, np.ndarray]:
     """Execute the continuous timestep-by-timestep rollout loop.
 
-    # REPLACED: keypose-based trajectory execution removed.
-    # Old loop: iterate over keyframes from actioner.predict(rgbs, pcds, gripper)
-    # with dense interpolation between keyposes. New loop queries the model
-    # every chunk_size steps and executes predicted actions one at a time.
+    Queries the model every chunk_size steps and executes predicted actions
+    one at a time.  obs_buffer is a proper cond_steps sliding window;
+    query_model pads it to cond_steps + num_steps internally before the model
+    call (matching LPWMAgent._build_input_frames).  Actions are sliced from
+    the prediction-only portion of action_rec (skipping context reconstruction).
 
     Returns:
         max_reward: highest reward seen across all steps.
         executed_steps: total number of env steps taken.
         actions_history: (max_steps, action_dim) all predicted actions.
-        obs_history: (n_views, max_steps, C,H,W) all observed images.
         last_rec: imagined frames from the final model query, or None.
+        obs_history: (n_views, max_steps, H, W, 3) all observed RGB frames.
+        imagination_history: (n_views, max_steps, H, W, 3) model\'s imagined frames.
     """
+    image_size = int(getattr(model, 'image_size', 128))
+    transform = build_image_transform(image_size)
+
     obs = initial_obs
     actions_history = np.zeros((max_steps, action_dim))
-    obs_history = np.zeros((model.n_views,max_steps, *obs.front_rgb.shape))
-    imagination_history = np.zeros((model.n_views,max_steps, *obs.front_rgb.shape))
+    obs_history = np.zeros((model.n_views, max_steps, image_size, image_size, 3))
+    imagination_history = np.zeros((model.n_views, max_steps, image_size, image_size, 3))
     max_reward = 0.0
     last_rec: Optional[torch.Tensor] = None
-    action_chunk: Optional[torch.Tensor] = None
-    chunk_cursor = chunk_size  # trigger a model query on the very first step
-    
-    
-    step_id = 0
+    action_buf: Optional[torch.Tensor] = None
+    action_idx = chunk_size  # triggers a model query on the very first step
 
-    # intialize buffers
-    obs_buffer =  extract_rgb_tensor(obs, camera_names, device).unsqueeze(0).permute(1,0,2,3,4)
+    # Initialise sliding-window obs buffer: [n_views, cond_steps, C, H, W]
+    first_rgb = extract_rgb_tensor(obs, camera_names, device, transform)
+    obs_buffer = first_rgb.unsqueeze(1).expand(-1, cond_steps, -1, -1, -1).clone()
 
+    # Initialise sliding-window action buffer: [cond_steps, action_dim]
     poses = np.concatenate([obs.gripper_pose, [obs.gripper_open]])
-    action_buffer = torch.from_numpy(poses).unsqueeze(0).float().to(device)
-    
-   
-    
+    first_pose = torch.from_numpy(poses).float().to(device)
+    action_buffer = first_pose.unsqueeze(0).expand(cond_steps, -1).clone()
+
+    step_id = 0
     while step_id < max_steps:
-        
-        ## FOR DEBUGGING
-        if chunk_cursor >= chunk_size:
-            last_rec, action_chunk = query_model(
+        # Re-query the model when the current chunk is exhausted.
+        if action_idx >= chunk_size:
+            last_rec, action_buf = query_model(
                 model, obs_buffer, action_buffer,
                 goal_tensor, language_goal, num_steps, cond_steps,
-                convert_to_6D
+                convert_to_6D,
             )
-            chunk_cursor = 0
-        
-       
-            
-        assert action_chunk is not None
-        action_chunk = action_chunk.squeeze() 
-        # @TODO investigate why it returns num_steps + 1 
-        
-        # assert action_chunk.shape[0]  == num_steps + cond_steps and action_chunk.shape[1] == action_dim
-        last_rec = last_rec.permute(1,0,2,3,4) # [Views, T, C, H , W] -> [T, Views, C, H, W]
-        assert last_rec.shape[0] == action_chunk.shape[0] # should be iterating over temporal dimension
-        
-        # @TODO, do we chop off cond_steps at the beginning?
-        for rec,action in zip(last_rec,action_chunk):
-            
-           
-            # handle step_id updates in inner loop – may get past loop g
-            if step_id >= max_steps:
-                break
-            
-            # action: torch.Tensor = action_chunk[0, chunk_cursor]  # (action_dim,)
-            chunk_cursor += 1
+            # action_buf: (num_steps, action_dim) — context steps already stripped
+            action_idx = 0
 
-         
-            
-            
-            # update histories         
-          
-            actions_history[step_id] = action.cpu().numpy()
-            
+        assert action_buf is not None
+        action: torch.Tensor = action_buf[action_idx]
+        action_idx += 1
 
-            
-            # @TODO 2x check for backward compatibility with single view
+        action_np = action.cpu().numpy().copy()
+        action_np[-1] = round(action_np[-1])  # binarise gripper open/close
+        actions_history[step_id] = action_np
 
-            action_np = action.cpu().numpy().copy()
-            action_np[-1] = round(action_np[-1])  # binarise gripper open/close
+        try:
+            obs, reward, terminate, _ = mover(action_np)
+            actual_action = np.concatenate([obs.gripper_pose, [obs.gripper_open]])
+            actual_action_t = torch.tensor(actual_action).float().to(device)
 
-            try:
-                obs, reward, terminate, _ = mover(action_np)
-                actual_action = np.concatenate([obs.gripper_pose, [obs.gripper_open]])
-                actual_action_t = torch.tensor(actual_action).float().to(device)
-             
-                # action_buffer = update_action_buffer(action_buffer, actual_action_t)
-                rgb = extract_rgb_tensor(obs, camera_names, device)
-                # obs_buffer = update_obs_buffer(obs_buffer, rgb)
-                
-                
-                # update buffers 
-                obs_buffer = rgb.unsqueeze(1)
-                action_buffer = actual_action_t.unsqueeze(0)
-                
-                # obs_buffer = torch.concat([obs_buffer,rgb.unsqueeze(1)],dim=1)
-                # action_buffer = torch.concat([action_buffer,actual_action_t.unsqueeze(0)],dim=0)
-                
-                # if obs_buffer.shape[1] >= 1:
-                #     obs_buffer = obs_buffer[:,-1:]
-                    
-                # if action_buffer.shape[0] >= 1:
-                #     action_buffer = action_buffer[-1:]
-                    
-                # @TODO attempt to generate actions from ground truth in chunks – feed it (gt_obs,gt_act)_t for t = 10, 20, ... 
-                # and verify it reconstructions cohesive trajectory
-                
-                # if that works, verify that generated_obs, generated_action are sufficiently close 
-                # can also try adding noise / interpoloating between the two and seeing what happens 
-                    
-                    
-             
-                   
-                   
-                assert rec.shape == rgb.shape
+            rgb = extract_rgb_tensor(obs, camera_names, device, transform)
+
+            # Slide the observation and action windows forward.
+            obs_buffer = torch.cat([obs_buffer[:, 1:], rgb.unsqueeze(1)], dim=1)
+            action_buffer = torch.cat([action_buffer[1:], actual_action_t.unsqueeze(0)], dim=0)
+
+            for view in range(model.n_views):
+                obs_history[view, step_id] = rgb[view].permute(1, 2, 0).cpu().numpy()
+
+            # Record the imagined frame at the corresponding prediction offset.
+            if last_rec is not None:
+                # last_rec shape from model: (n_views, cond_steps + num_steps, C, H, W)
+                pred_offset = min(cond_steps + action_idx - 1, last_rec.shape[1] - 1)
                 for view in range(model.n_views):
-                    obs_history[view,step_id] = rgb[view].squeeze().permute(1,2,0).cpu().numpy() # output of predict is (C,H,W), reshape to (H,W,C)
-                    imagination_history[view,step_id] = rec[view].squeeze().permute(1,2,0).cpu().numpy()
-            
-            
-            except (IKError, ConfigurationPathError, InvalidActionError) as exc:
-                print(f"  step {step_id} execution error: {exc}")
-                break
+                    imagination_history[view, step_id] = (
+                        last_rec[view, pred_offset].permute(1, 2, 0).cpu().numpy()
+                    )
 
-            max_reward = max(max_reward, float(reward))
-            if verbose:
-                print(f"  step {step_id}  reward={reward:.2f}")
-            if reward == 1.0 or terminate:
-                break
-            # update step id 
-            step_id +=1 
+        except (IKError, ConfigurationPathError, InvalidActionError) as exc:
+            print(f"  step {step_id} execution error: {exc}")
+            break
 
-   
+        max_reward = max(max_reward, float(reward))
+        if verbose:
+            print(f"  step {step_id}  reward={reward:.2f}")
+        if reward == 1.0 or terminate:
+            break
+        step_id += 1
+
     return max_reward, step_id + 1, actions_history, last_rec, obs_history, imagination_history
+
+
+def _reset_env_to_demo(task, demo) -> Tuple[List[str], Any]:
+    """Reset the RLBench task to the initial state recorded in the given demo.
+
+    Equivalent to evaluate_simulation.py's _reset_env_to_state but for RLBench.
+    RLBench demos contain recorded observations; reset_to_demo replays the exact
+    initial environment state, giving deterministic episode starts.
+
+    Args:
+        task: RLBench task instance.
+        demo: RLBench Demo object loaded via env.get_demo().
+
+    Returns:
+        descriptions: list of natural-language task descriptions.
+        obs: initial RLBench Observation after reset.
+    """
+    try:
+        descriptions, obs = task.reset_to_demo(demo)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to reset task to demo state: {exc}") from exc
+    return descriptions, obs
 
 
 @torch.no_grad()
@@ -777,81 +783,61 @@ def run_episode(
     # Set to None to disable goal conditioning.
     goal_tensor: Optional[torch.Tensor] = None
 
-   
-                
-    descriptions, obs = task.reset_to_demo(demo)
+    # Use _reset_env_to_demo for deterministic state reset from the recorded demo.
+    descriptions, obs = _reset_env_to_demo(task, demo)
     mover = Mover(task, max_tries=args.max_tries)
-    
-    
-    # TODO: Define language embedding source. Replace `language_goal` with either
-    # a call to an encoder or a lookup from precomputed embeddings.
+
+    # Language embedding: encode one of the task descriptions with T5.
+    desc: str = ""
     if model.language_condition:
-    
         tokenizer = T5Tokenizer.from_pretrained('t5-large')
         encoder = T5EncoderModel.from_pretrained('t5-large')
-        encoder.eval()  # Set to evaluation mode
+        encoder.eval()
         desc = descriptions[np.random.randint(len(descriptions))]
-        
-        tokenized_desc = tokenizer(desc, max_length=model.language_max_len, padding='max_length', truncation=True, return_tensors='pt')
-        tokenized_desc=  tokenized_desc['input_ids']  # Return a 1D tensor
+        tokenized_desc = tokenizer(
+            desc, max_length=model.language_max_len,
+            padding='max_length', truncation=True, return_tensors='pt',
+        )
+        tokenized_desc = tokenized_desc['input_ids']
         language_goal = encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(device)
         print(f"[DEBUG] using desc: {desc=} | {language_goal.median()=}")
     else:
         language_goal = None
-    
-    
-    # first_rgb = extract_rgb_tensor(obs, args.cameras, device)
-    # obs_buffer = init_obs_buffer(first_rgb, args.cond_steps)
-    # obs_buffer = obs_buffer.repeat(1,2,1,1,1)
-
-    # initial action buffer with first poses
-    # poses = np.concatenate([obs.gripper_pose, [obs.gripper_open]])
-    # poses = torch.from_numpy(poses).unsqueeze(0).float().to(device)
-    # action_buffer = poses
-    # action_buffer = action_buffer.repeat(2,1)
-    
-    # action_buffer = init_action_buffer(args.cond_steps, args.action_dim, device)
-    # action_buffer = torch.tensor(gt_actions[0]).unsqueeze(0).float().to(device)
-    # action_buffer = torch.zeros_like(torch.tensor(gt_actions[0]).unsqueeze(0).float().to(device))
 
     max_reward, executed_steps, actions_history, last_rec, obs_history, imagination_history = _run_step_loop(
         task=task, mover=mover, initial_obs=obs,
-        # obs_buffer=obs_buffer, action_buffer=action_buffer,
         model=model, language_goal=language_goal, goal_tensor=goal_tensor,
         camera_names=args.cameras, device=device,
         max_steps=args.max_steps, num_steps=args.num_steps,
         cond_steps=args.cond_steps, chunk_size=args.chunk_size,
         action_dim=args.action_dim, verbose=bool(args.verbose),
         convert_to_6D=bool(args.convert_to_6D),
-        output_dir=output_dir
+        output_dir=output_dir,
     )
 
-   
     save_episode_visualizations(
         model=model, actions_history=actions_history,
         gt_actions=gt_actions, gt_frames_cam0=gt_frames_cam0,
-        gt_frames_cam1=gt_frames_cam1, imagined_traj=imagination_history, obs_history = obs_history,
-        executed_steps=executed_steps, task_str=task_str,
-        demo_id=demo_id, cond_steps=args.cond_steps,
-        output_dir=output_dir,
-        gif_fps=args.gif_fps,
-        variation=variation_num,
-        language_goal=desc
+        gt_frames_cam1=gt_frames_cam1, imagined_traj=imagination_history,
+        obs_history=obs_history, executed_steps=executed_steps,
+        task_str=task_str, demo_id=demo_id, cond_steps=args.cond_steps,
+        output_dir=output_dir, gif_fps=args.gif_fps,
+        variation=variation_num, language_goal=desc,
     )
-    
-    # comparison with vidoe generation rollout
-    # animate_trajectory_ddlp(model, config, 0, device=device, fig_dir=output_dir,
-    #                                     timestep_horizon= args.max_steps // 2, num_trajetories=1,
-    #                                     train=True, cond_steps=args.cond_steps,use_all_ctx=False)
-    
-    # feed sim data into the animate trajectory function
-    x_horizon = (torch.from_numpy(_normalize_01(np.stack([gt_frames_cam0,gt_frames_cam1]))).permute(0,1,4,2,3))
+
+    # Feed sim data into animate_trajectory_coparticle for offline diagnosis.
+    x_horizon = (
+        torch.from_numpy(_normalize_01(np.stack([gt_frames_cam0, gt_frames_cam1])))
+        .permute(0, 1, 4, 2, 3)
+    )
     actions_horizon = action_xyzw_to_ortho6d(torch.from_numpy(gt_actions)).unsqueeze(0)
     animate_trajectory_coparticle(
-        model, 
-        x_horizon=x_horizon, actions_horizon=actions_horizon,lang_embed=language_goal,lang_str=desc,
-        epoch=variation_num,device=device,fig_dir=output_dir,timestep_horizon= args.max_steps // 2, num_trajetories=1,
-        train=True, cond_steps=args.cond_steps,use_all_ctx=False
+        model,
+        x_horizon=x_horizon, actions_horizon=actions_horizon,
+        lang_embed=language_goal, lang_str=desc,
+        epoch=variation_num, device=device, fig_dir=output_dir,
+        timestep_horizon=args.max_steps // 2, num_trajetories=1,
+        train=True, cond_steps=args.cond_steps, use_all_ctx=False,
     )
     return max_reward
 
