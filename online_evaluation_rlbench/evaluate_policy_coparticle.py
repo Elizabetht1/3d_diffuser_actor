@@ -224,6 +224,7 @@ def animate_trajectory_coparticle(model, x_horizon, actions_horizon, lang_embed,
             root = fig_dir,
             id=f"stoch_{epoch}"
         )
+    return preds_2, action_rec_2
      
      
 
@@ -643,19 +644,11 @@ def _run_step_loop(
     poses = np.concatenate([obs.gripper_pose, [obs.gripper_open]])
     action_buffer = torch.from_numpy(poses).unsqueeze(0).float().to(device)
     
-    ## FOR DEBUGGING
-    ts_horiz = max_steps // 2
-    x_horizon = obs_buffer.repeat(1,ts_horiz,1,1,1)
-    actions_horizon = action_xyzw_to_ortho6d(action_buffer).repeat(1,ts_horiz,1)
-    animate_trajectory_coparticle(
-        model, 
-        x_horizon=x_horizon, actions_horizon=actions_horizon,lang_embed=language_goal,lang_str="abcd",
-        epoch=int(datetime.now().microsecond),device=device,fig_dir=output_dir,timestep_horizon= ts_horiz, num_trajetories=1,
-        train=True, cond_steps=cond_steps,use_all_ctx=False
-    )
-    
+   
     
     while step_id < max_steps:
+        
+        ## FOR DEBUGGING
         if chunk_cursor >= chunk_size:
             last_rec, action_chunk = query_model(
                 model, obs_buffer, action_buffer,
@@ -670,10 +663,12 @@ def _run_step_loop(
         action_chunk = action_chunk.squeeze() 
         # @TODO investigate why it returns num_steps + 1 
         
-        assert action_chunk.shape[0]  == num_steps + cond_steps and action_chunk.shape[1] == action_dim
+        # assert action_chunk.shape[0]  == num_steps + cond_steps and action_chunk.shape[1] == action_dim
         last_rec = last_rec.permute(1,0,2,3,4) # [Views, T, C, H , W] -> [T, Views, C, H, W]
         assert last_rec.shape[0] == action_chunk.shape[0] # should be iterating over temporal dimension
-        for rec,action in zip(last_rec[cond_steps:],action_chunk[cond_steps:]):
+        
+        # @TODO, do we chop off cond_steps at the beginning?
+        for rec,action in zip(last_rec,action_chunk):
             
            
             # handle step_id updates in inner loop – may get past loop g
@@ -708,15 +703,17 @@ def _run_step_loop(
                 
                 
                 # update buffers 
+                obs_buffer = rgb.unsqueeze(1)
+                action_buffer = actual_action_t.unsqueeze(0)
                 
-                obs_buffer = torch.concat([obs_buffer,rgb.unsqueeze(1)],dim=1)
-                action_buffer = torch.concat([action_buffer,actual_action_t.unsqueeze(0)],dim=0)
+                # obs_buffer = torch.concat([obs_buffer,rgb.unsqueeze(1)],dim=1)
+                # action_buffer = torch.concat([action_buffer,actual_action_t.unsqueeze(0)],dim=0)
                 
-                if obs_buffer.shape[1] >= 1:
-                    obs_buffer = obs_buffer[:,-1:]
+                # if obs_buffer.shape[1] >= 1:
+                #     obs_buffer = obs_buffer[:,-1:]
                     
-                if action_buffer.shape[0] >= 1:
-                    action_buffer = action_buffer[-1:]
+                # if action_buffer.shape[0] >= 1:
+                #     action_buffer = action_buffer[-1:]
                     
                 # @TODO attempt to generate actions from ground truth in chunks – feed it (gt_obs,gt_act)_t for t = 10, 20, ... 
                 # and verify it reconstructions cohesive trajectory
