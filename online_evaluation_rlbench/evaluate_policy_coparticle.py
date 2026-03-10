@@ -320,8 +320,8 @@ def extract_rgb_tensor(
     frames: List[torch.Tensor] = []
     for cam in camera_names:
         rgb_np: np.ndarray = getattr(obs, f"{cam}_rgb")  # (H, W, 3) uint8
-        rgb_np = _normalize_01(rgb_np)
-        rgb = torch.from_numpy(rgb_np).float().permute(2, 0, 1) / 255.0
+        rgb_np = _normalize_01(rgb_np) # normalize
+        rgb = torch.from_numpy(rgb_np).float().permute(2, 0, 1) 
         frames.append(rgb)
     return torch.stack(frames).to(device)  # (num_views, 3, H, W)
 
@@ -608,7 +608,8 @@ def _run_step_loop(
     chunk_size: int,
     action_dim: int,
     verbose: bool,
-    convert_to_6D: bool
+    convert_to_6D: bool,
+    output_dir: str,
 ) -> Tuple[float, int, np.ndarray, Optional[torch.Tensor],np.ndarray, np.ndarray]:
     """Execute the continuous timestep-by-timestep rollout loop.
 
@@ -642,10 +643,19 @@ def _run_step_loop(
     poses = np.concatenate([obs.gripper_pose, [obs.gripper_open]])
     action_buffer = torch.from_numpy(poses).unsqueeze(0).float().to(device)
     
+    ## FOR DEBUGGING
+    ts_horiz = max_steps // 2
+    x_horizon = obs_buffer.repeat(1,ts_horiz,1,1,1)
+    actions_horizon = action_xyzw_to_ortho6d(action_buffer).repeat(1,ts_horiz,1)
+    animate_trajectory_coparticle(
+        model, 
+        x_horizon=x_horizon, actions_horizon=actions_horizon,lang_embed=language_goal,lang_str="abcd",
+        epoch=int(datetime.now().microsecond),device=device,fig_dir=output_dir,timestep_horizon= ts_horiz, num_trajetories=1,
+        train=True, cond_steps=cond_steps,use_all_ctx=False
+    )
+    
+    
     while step_id < max_steps:
-
-        
-        
         if chunk_cursor >= chunk_size:
             last_rec, action_chunk = query_model(
                 model, obs_buffer, action_buffer,
@@ -660,7 +670,7 @@ def _run_step_loop(
         action_chunk = action_chunk.squeeze() 
         # @TODO investigate why it returns num_steps + 1 
         
-        # assert action_chunk.shape[0]  == num_steps and action_chunk.shape[1] == action_dim
+        assert action_chunk.shape[0]  == num_steps + cond_steps and action_chunk.shape[1] == action_dim
         last_rec = last_rec.permute(1,0,2,3,4) # [Views, T, C, H , W] -> [T, Views, C, H, W]
         assert last_rec.shape[0] == action_chunk.shape[0] # should be iterating over temporal dimension
         for rec,action in zip(last_rec[cond_steps:],action_chunk[cond_steps:]):
@@ -770,18 +780,14 @@ def run_episode(
     # Set to None to disable goal conditioning.
     goal_tensor: Optional[torch.Tensor] = None
 
-    # TODO: Define language embedding source. Replace `language_goal` with either
-    # a call to an encoder or a lookup from precomputed embeddings.
-    
-   
-
    
                 
     descriptions, obs = task.reset_to_demo(demo)
     mover = Mover(task, max_tries=args.max_tries)
     
     
-    
+    # TODO: Define language embedding source. Replace `language_goal` with either
+    # a call to an encoder or a lookup from precomputed embeddings.
     if model.language_condition:
     
         tokenizer = T5Tokenizer.from_pretrained('t5-large')
@@ -811,7 +817,6 @@ def run_episode(
     # action_buffer = torch.tensor(gt_actions[0]).unsqueeze(0).float().to(device)
     # action_buffer = torch.zeros_like(torch.tensor(gt_actions[0]).unsqueeze(0).float().to(device))
 
-    
     max_reward, executed_steps, actions_history, last_rec, obs_history, imagination_history = _run_step_loop(
         task=task, mover=mover, initial_obs=obs,
         # obs_buffer=obs_buffer, action_buffer=action_buffer,
@@ -820,7 +825,8 @@ def run_episode(
         max_steps=args.max_steps, num_steps=args.num_steps,
         cond_steps=args.cond_steps, chunk_size=args.chunk_size,
         action_dim=args.action_dim, verbose=bool(args.verbose),
-        convert_to_6D=bool(args.convert_to_6D)
+        convert_to_6D=bool(args.convert_to_6D),
+        output_dir=output_dir
     )
 
    
@@ -1017,3 +1023,7 @@ if __name__ == "__main__":
 # if the generation deteirorites => it is a data issue. Use animate_trajectories_ddlp to figure out data flaw. 
 # potential hypotheses: we are not trained on intial obs but instead first actions 
 # hypothesis – unnormalized ?? 
+
+# @TODO check cond_steps in evaluate script 
+# @TODO reduce action chunk based on reconstruction quality
+# @TODO check camera image quality
