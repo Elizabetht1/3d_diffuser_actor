@@ -1,7 +1,7 @@
 import os
 import glob
 import random
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Sequence, Iterable
 from pathlib import Path
 import json
 
@@ -23,6 +23,10 @@ from rlbench.backend.exceptions import InvalidActionError
 from rlbench.demo import Demo
 from pyrep.errors import IKError, ConfigurationPathError
 from pyrep.const import RenderMode
+
+from lpwm_dev.rlbench_utils.geometry import action_ortho6d_to_xyzw,action_xyzw_to_ortho6d
+from transformers import T5Tokenizer, T5EncoderModel
+from online_evaluation_rlbench.utils import Verify2
 
 
 ALL_RLBENCH_TASKS = [
@@ -64,70 +68,198 @@ def load_episodes() -> Dict[str, Any]:
         return json.load(fid)
 
 
-class Mover:
 
-    def __init__(self, task, disabled=False, max_tries=1):
-        self._task = task
-        self._last_action = None
-        self._step_id = 0
-        self._max_tries = max_tries
-        self._disabled = disabled
+class Actioner_Coparticle:
 
-    def __call__(self, action, collision_checking=False):
-        if self._disabled:
-            return self._task.step(action)
+    def __init__(
+        self,
+        policy=None,
+        instructions=None,
+        apply_cameras=("left_shoulder", "right_shoulder", "wrist"),
+        action_dim=7,
+        predict_trajectory=True,
+        convert_6D=False,
+        num_pred_steps=10,
+        cond_steps=1,
+        deterministic=True,
+        max_length = 12,
+    ):
+        self._policy = policy
+        self._instructions = instructions
+        self._apply_cameras = apply_cameras
+        self._action_dim = action_dim
+        self._predict_trajectory = predict_trajectory
 
-        target = action.copy()
-        if self._last_action is not None:
-            action[7] = self._last_action[7].copy()
+        self._actions = {}
+        self._instr = None
+        self._task_str = None
+        self._convert_6D = convert_6D
+        self._deterministic = deterministic
+        
+        self.num_pred_steps = num_pred_steps
+        self.cond_steps = cond_steps
+        self._max_length = max_length
+        
+        self._tokenizer = T5Tokenizer.from_pretrained('t5-large')
+        self._t5_encoder = T5EncoderModel.from_pretrained('t5-large')
+        self._t5_encoder.eval()
 
-        images = []
-        try_id = 0
-        obs = None
-        terminate = None
-        reward = 0
+        self._policy.eval()
 
-        for try_id in range(self._max_tries):
-            action_collision = np.ones(action.shape[0]+1)
-            action_collision[:-1] = action
-            if collision_checking:
-                action_collision[-1] = 0
-            obs, reward, terminate = self._task.step(action_collision)
+    def _embed(self, descriptions):
+        desc = descriptions[np.random.randint(len(descriptions))]
+        tokenized_desc = self._tokenizer(
+            desc, max_length=self._max_length,
+            padding='max_length', truncation=True, return_tensors='pt',
+        )
+        tokenized_desc = tokenized_desc['input_ids']
+        with torch.no_grad():
+            return self._t5_encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device)
+        
+        
+    def load_episode(self, task_str, variation, descriptions):
+        self._task_str = task_str
+        self._instr = self._embed(descriptions)
+        self._task_id = torch.tensor(TASK_TO_ID[task_str]).unsqueeze(0)
+        self._actions = {}
+        
+    def load_instruction(self):
+        # @TODO implement me
+        pass 
+    
+    def _build_input_frames(
+        self,
+        obs_sequence: Sequence[np.ndarray],
+    ) -> List[np.ndarray]:
+        
+        obs_sequence = list(obs_sequence)
+        
+        if not obs_sequence:
+            raise ValueError('obs_sequence must contain at least one observation.')
+    
+        cond_steps = self.cond_steps
+        num_pred_steps = self.num_pred_steps
+        
+        cond_frames = obs_sequence[-cond_steps:]
+        if len(cond_frames) < cond_steps:
+            raise ValueError('conditioning steps does not match conditiong data.')
 
-            pos = obs.gripper_pose[:3]
-            rot = obs.gripper_pose[3:7]
-            dist_pos = np.sqrt(np.square(target[:3] - pos).sum())
-            dist_rot = np.sqrt(np.square(target[3:7] - rot).sum())
-            criteria = (dist_pos < 5e-3,)
+        last = cond_frames[-1]
+        return cond_frames + [last] * int(num_pred_steps)
+    
+    def _preprocess_frames(self, frames: Iterable[np.ndarray]) -> torch.Tensor:
+        tensors = [self._preprocess_single_image(img) for img in frames]
+        # stack: [T, n_views, C, H, W] -> unsqueeze: [1, T, n_views, H, W, C]
+        frames_tensor = torch.stack(tensors, dim=0).unsqueeze(0)
+        assert frames_tensor.ndim == 6  # (bs=1, T, n_views, H, W, C)
+        
+        frames_tensor = frames_tensor.permute(0,1,2,5,3,4)  # (bs=1, T, n_views,C, H, W,)
+        
+        # handle multiview reshaping
+        n_views = self._policy.n_views
+        if n_views > 1:
+            if not frames_tensor.shape[2] == n_views:
+                raise ValueError("frames do not have correct dimensionality")
+            
+            
+            frames_tensor = frames_tensor.permute(0, 2, 1, 3, 4, 5)
+            frames_tensor = frames_tensor.reshape(-1, *frames_tensor.shape[2:])  # [bs * n_views, T, ...]
+        
+        
+    
+        return frames_tensor
+    
+    
+    def _preprocess_single_image(self, image):
+        """Expect numpy array (n_views, H, W, C) in [0, 255].
+        Returns tensor (n_views, C, H, W) in [0, 1] on self.device."""
+        if isinstance(image, torch.Tensor):
+            raise ValueError('Input image should be a numpy array')
+        if image.ndim != 4:
+            raise ValueError(f'Unsupported image shape: {tuple(image.shape)}')
+        return torch.from_numpy(image).float().div(255.0).to(self.device)
+    
+    def _preprocess_actions(self,
+                            actions_seq: Iterable[torch.Tensor]
+                            ):
+        
+        
+        # if not isinstance(actions_seq,np.ndarray):
+        #     raise ValueError("actions seq should be np array ") 
+        actions = torch.stack(actions_seq, dim=0)
+        actions = actions.float().to(self.device)
+        
+        # convert dims as needed
+        if self._convert_6D:
+            actions = action_xyzw_to_ortho6d(actions)
+        
+        
+        # pad as needed 
+        cond_steps = self.cond_steps
+        num_pred_steps = self.num_pred_steps
+        target_len = cond_steps + num_pred_steps
+        
+       
+        
+        T, adim = actions.shape
+        if T < target_len:
+            pad_len = target_len - T
+            pad = actions[-1:].repeat(pad_len, 1)
+            actions = torch.cat([actions, pad], dim=0)
+        return actions.unsqueeze(0)
+        
+    def predict(self, rgbs, pcds=None, actions=None, interpolation_length=None):
+        """
+        Args:
+            rgbs: (bs, nhist, num_cameras, 3, H, W)
+            pcds: ignored (signature compatibility with Actioner)
+            actions: (bs, nhist, action_dim) tensor, or (T, action_dim) numpy array
+            interpolation_length: ignored (signature compatibility with Actioner)
+        Returns:
+            {"action": None, "trajectory": np.ndarray}
+        """
+        output = {"action": None, "trajectory": None}
 
-            if all(criteria) or reward == 1:
-                break
+        if self._instr is None:
+            raise ValueError()
 
-            print(
-                f"Too far away (pos: {dist_pos:.3f}, rot: {dist_rot:.3f}, step: {self._step_id})... Retrying..."
+        self._instr = self._instr.to(self.device)
+        self._task_id = self._task_id.to(self.device)
+
+        # perform all preprocessing
+        
+        rgbs = self._build_input_frames(rgbs)
+        rgbs = self._preprocess_frames(rgbs)
+        
+        actions = self._preprocess_actions(actions)
+        
+
+        with torch.no_grad():
+            rec, action_rec, _, _ = self._policy.sample_from_x(
+                x=rgbs,
+                num_steps=self.num_pred_steps,
+                cond_steps=self.cond_steps,
+                deterministic=self._deterministic,
+                decode=True,
+                n_pred_eq_gt=False,
+                return_aux_rec=True,
+                actions=actions,
+                lang_embed=self._instr
             )
+            if self._convert_6D:
+                action_rec = action_ortho6d_to_xyzw(action_rec)
+            
+            # ignore the appended reconstructions
+            action_rec = action_rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
+            trajectory = action_rec
+            # trajectory = action_rec.cpu().numpy()
+            output['trajectory'] = trajectory
 
-        # we execute the gripper action after re-tries
-        action = target
-        if (
-            not reward == 1.0
-            and self._last_action is not None
-            and action[7] != self._last_action[7]
-        ):
-            action_collision = np.ones(action.shape[0]+1)
-            action_collision[:-1] = action
-            if collision_checking:
-                action_collision[-1] = 0
-            obs, reward, terminate = self._task.step(action_collision)
+        return output
 
-        if try_id == self._max_tries:
-            print(f"Failure after {self._max_tries} tries")
-
-        self._step_id += 1
-        self._last_action = action.copy()
-
-        return obs, reward, terminate, images
-
+    @property
+    def device(self):
+        return next(self._policy.parameters()).device
 
 class Actioner:
 
@@ -151,7 +283,7 @@ class Actioner:
 
         self._policy.eval()
 
-    def load_episode(self, task_str, variation):
+    def load_episode(self, task_str, variation,descriptions):
         self._task_str = task_str
         instructions = list(self._instructions[task_str][variation])
         self._instr = random.choice(instructions).unsqueeze(0)
@@ -202,8 +334,6 @@ class Actioner:
             {"action": torch.Tensor, "trajectory": torch.Tensor}
         """
         output = {"action": None, "trajectory": None}
-
-        rgbs = rgbs / 2 + 0.5  # in [0, 1]
 
         if self._instr is None:
             raise ValueError()
@@ -280,8 +410,10 @@ class RLBenchEnv:
         headless=False,
         apply_cameras=("left_shoulder", "right_shoulder", "wrist", "front"),
         fine_sampling_ball_diameter=None,
-        collision_checking=False
+        collision_checking=False,
+        args=None
     ):
+        
 
         # setup required inputs
         self.data_path = data_path
@@ -305,6 +437,8 @@ class RLBenchEnv:
             headless=headless
         )
         self.image_size = image_size
+        
+        self.args = args
 
     def get_obs_action(self, obs):
         """
@@ -405,7 +539,7 @@ class RLBenchEnv:
             variation_number=variation,
             amount=1,
             from_episode_number=episode_index,
-            random_selection=False
+            random_selection=False,
         )
         return demos
 
@@ -451,7 +585,7 @@ class RLBenchEnv:
                     verbose=verbose,
                     dense_interpolation=dense_interpolation,
                     interpolation_length=interpolation_length,
-                    num_history=num_history
+                    num_history=num_history,
                 )
             )
             if valid:
@@ -481,6 +615,7 @@ class RLBenchEnv:
         dense_interpolation=False,
         interpolation_length=50,
         num_history=0,
+        coparticle = True,
     ):
         device = actioner.device
 
@@ -498,6 +633,29 @@ class RLBenchEnv:
                 num_valid_demos += 1
             except:
                 continue
+            
+            # verify
+            verifier = Verify2(
+                actioner=actioner,
+                demo=demo,
+                env=self,
+                task=task,
+                task_str=task_str,
+                max_steps=max_steps,
+                max_tries=max_tries,
+                verbose=verbose,
+                device=actioner.device,
+                logdir="eval_outputs"
+            )
+            verifier.test_1_replay_demo()
+            verifier.test_2_image_preprocessing()
+            verifier.test_3_action_preprocessing()
+            verifier.test_4_quant_conversion()
+            # verifier.test_5_replay_open_loop() # @TODO debug
+            verifier.test_6_replay_recon()
+            verifier.test_7_replay_recon_with_ctx()
+            
+            
 
             rgbs = torch.Tensor([]).to(device)
             pcds = torch.Tensor([]).to(device)
@@ -506,8 +664,7 @@ class RLBenchEnv:
             # descriptions, obs = task.reset()
             descriptions, obs = task.reset_to_demo(demo)
 
-            actioner.load_episode(task_str, variation)
-
+            actioner.load_episode(task_str, variation, descriptions)
             move = Mover(task, max_tries=max_tries)
             reward = 0.0
             max_reward = 0.0
@@ -515,27 +672,44 @@ class RLBenchEnv:
             for step_id in range(max_steps):
 
                 # Fetch the current observation, and predict one action
-                rgb, pcd, gripper = self.get_rgb_pcd_gripper_from_obs(obs)
-                rgb = rgb.to(device)
-                pcd = pcd.to(device)
-                gripper = gripper.to(device)
+                if coparticle: 
+                    state_dict, gripper = self.get_obs_action(obs)
+                    rgbs_input = [np.stack(state_dict['rgb'],axis=0)]  # (num_cameras, H, W, C)   
+                    pcds_input = None
+                    gripper_input = [gripper]
+                
+                else: 
+                    rgb, pcd, gripper = self.get_rgb_pcd_gripper_from_obs(obs)
+                    rgb = rgb.to(device)
+                    pcd = pcd.to(device)
+                    gripper = gripper.to(device)
 
-                rgbs = torch.cat([rgbs, rgb.unsqueeze(1)], dim=1)
-                pcds = torch.cat([pcds, pcd.unsqueeze(1)], dim=1)
-                grippers = torch.cat([grippers, gripper.unsqueeze(1)], dim=1)
+                    rgbs = torch.cat([rgbs, rgb.unsqueeze(1)], dim=1)
+                    pcds = torch.cat([pcds, pcd.unsqueeze(1)], dim=1)
+                    grippers = torch.cat([grippers, gripper.unsqueeze(1)], dim=1)
 
-                # Prepare proprioception history
-                rgbs_input = rgbs[:, -1:][:, :, :, :3]
-                pcds_input = pcds[:, -1:]
-                if num_history < 1:
-                    gripper_input = grippers[:, -1]
-                else:
-                    gripper_input = grippers[:, -num_history:]
-                    npad = num_history - gripper_input.shape[1]
-                    gripper_input = F.pad(
-                        gripper_input, (0, 0, npad, 0), mode='replicate'
-                    )
+                    # Prepare proprioception history
+                    if num_history < 1:
+                        rgbs_input = rgbs[:, -1:][:, :, :, :3]
+                        pcds_input = pcds[:, -1:]
+                        gripper_input = grippers[:, -1]
+                    else:
+                        rgbs_input = rgbs[:, -num_history:][:, :, :, :3]
+                        pcds_input = pcds[:, -num_history:]
+                        gripper_input = grippers[:, -num_history:]
+                        npad = num_history - gripper_input.shape[1]
+                        if npad > 0:
+                            rgbs_input = F.pad(
+                                rgbs_input, (0, 0, 0, 0, 0, 0, npad, 0), mode='replicate'
+                            )
+                            pcds_input = F.pad(
+                                pcds_input, (0, 0, 0, 0, 0, 0, npad, 0), mode='replicate'
+                            )
+                            gripper_input = F.pad(
+                                gripper_input, (0, 0, npad, 0), mode='replicate'
+                            )
 
+                
                 output = actioner.predict(
                     rgbs_input,
                     pcds_input,
@@ -557,6 +731,7 @@ class RLBenchEnv:
 
                         # execute
                         for action in tqdm(trajectory):
+                            breakpoint()
                             #try:
                             #    collision_checking = self._collision_checking(task_str, step_id)
                             #    obs, reward, terminate, _ = move(action_np, collision_checking=collision_checking)
@@ -830,9 +1005,8 @@ def transform(obs_dict, scale_size=(0.75, 1.25), augmentation=False):
         if augmentation:
             raise NotImplementedError()  # Deprecated
 
-        # normalise to [-1, 1]
+        # normalise to [0, 1]
         rgb = rgb / 255.0
-        rgb = 2 * (rgb - 0.5)
 
         obs_rgb += [rgb.float()]
         if depth is not None:

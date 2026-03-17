@@ -16,10 +16,11 @@ from utils.common_utils import (
     get_gripper_loc_bounds,
     round_floats
 )
-from utils.utils_with_rlbench import RLBenchEnv, Actioner, load_episodes
-
+from utils.utils_with_rlbench import RLBenchEnv, Actioner, load_episodes, Actioner_Coparticle
+from lpwm_dev.model_factory import build_model 
 
 class Arguments(tap.Tap):
+    config: Path = ""
     checkpoint: Path = ""
     seed: int = 2
     device: str = "cuda"
@@ -143,7 +144,8 @@ def load_models(args):
     return model
 
 
-if __name__ == "__main__":
+def main_coparticle():
+    
     # Arguments
     args = Arguments().parse_args()
     args.cameras = tuple(x for y in args.cameras for x in y.split(","))
@@ -151,7 +153,87 @@ if __name__ == "__main__":
     print(args)
     print("-" * 100)
     # Save results here
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
+
+    # Seeds
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    
+     # Load RLBench environment
+    env = RLBenchEnv(
+        data_path=args.data_dir,
+        image_size=[int(x) for x in args.image_size.split(",")],
+        apply_rgb=True,
+        apply_pc=True,
+        headless=bool(args.headless),
+        apply_cameras=args.cameras,
+        collision_checking=bool(args.collision_checking)
+    )
+
+    instruction = load_instructions(args.instructions)
+    if instruction is None:
+        raise NotImplementedError()
+
+    model = build_model(args.config)
+    
+    with open(args.config,'r') as fin:
+        config = json.load(fin)
+    
+    actioner = Actioner_Coparticle(
+        policy=model,
+        apply_cameras=args.cameras,
+        action_dim=args.action_dim,
+        convert_6D=config['convert_6D'],
+        num_pred_steps=config['timestep_horizon'],
+        cond_steps = config['cond_steps'],
+        deterministic=True,
+        max_length=config['language_max_len']
+    )
+    
+    max_eps_dict = load_episodes()["max_episode_length"]
+    task_success_rates = {}
+
+    for task_str in args.tasks:
+        var_success_rates = env.evaluate_task_on_multiple_variations(
+            task_str,
+            max_steps=(
+                max_eps_dict[task_str] if args.max_steps == -1
+                else args.max_steps
+            ),
+            num_variations=args.variations[-1] + 1,
+            num_demos=args.num_episodes,
+            actioner=actioner,
+            max_tries=args.max_tries,
+            dense_interpolation=bool(args.dense_interpolation),
+            interpolation_length=args.interpolation_length,
+            verbose=bool(args.verbose),
+            num_history=args.num_history
+        )
+        print()
+        print(
+            f"{task_str} variation success rates:",
+            round_floats(var_success_rates)
+        )
+        print(
+            f"{task_str} mean success rate:",
+            round_floats(var_success_rates["mean"])
+        )
+
+        task_success_rates[task_str] = var_success_rates
+        with open(args.output_file, "w") as f:
+            json.dump(round_floats(task_success_rates), f, indent=4)
+
+
+def main_3ddfa():
+    # Arguments
+    args = Arguments().parse_args()
+    args.cameras = tuple(x for y in args.cameras for x in y.split(","))
+    print("Arguments:")
+    print(args)
+    print("-" * 100)
+    # Save results here
+    Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
 
     # Seeds
     torch.manual_seed(args.seed)
@@ -169,7 +251,8 @@ if __name__ == "__main__":
         apply_pc=True,
         headless=bool(args.headless),
         apply_cameras=args.cameras,
-        collision_checking=bool(args.collision_checking)
+        collision_checking=bool(args.collision_checking),
+        args=args
     )
 
     instruction = load_instructions(args.instructions)
@@ -215,3 +298,10 @@ if __name__ == "__main__":
         task_success_rates[task_str] = var_success_rates
         with open(args.output_file, "w") as f:
             json.dump(round_floats(task_success_rates), f, indent=4)
+
+
+if __name__ == "__main__":
+    main_coparticle()
+    
+
+    

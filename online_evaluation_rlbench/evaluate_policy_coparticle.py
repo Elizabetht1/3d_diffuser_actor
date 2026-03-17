@@ -34,11 +34,14 @@ from datetime import datetime
 from utils.common_utils import round_floats
 
 from utils.utils_with_rlbench import (
-    Mover,
     RLBenchEnv,
     load_episodes,
     task_file_to_task_class,
 )
+
+from utils.mover import Mover
+
+from online_evaluation_rlbench.utils import Verify
 
 # REPLACED: Actioner removed.
 # Actioner.predict(rgbs, pcds, gripper) called DiffuserActor/Act3D with
@@ -59,72 +62,9 @@ from lpwm_dev.eval.eval_model import animate_trajectory_ddlp
 def animate_trajectory_coparticle(model, x_horizon, actions_horizon, lang_embed, lang_str, epoch, device=torch.device('cpu'), fig_dir='./', timestep_horizon=3,
                             num_trajetories=5, accelerator=None, train=False, prefix='', cond_steps=None,
                             deterministic=True, det_and_stoch=True, use_all_ctx=True,animation_fps = 10):
-    # load data
-    # ds = config['ds']
-    # ch = config['ch']  # image channels
-    # image_size = config['image_size']
-    # n_views = config.get('n_views', 1)
-    # root = config['root']  # dataset root
-    # duration = config['animation_fps']
-    # action_condition = config.get('action_condition', False)
-    # language_condition = config.get('language_condition', False)
-    # img_goal_condition = config.get('image_goal_condition', False)
-    # views = config.get('views',['front'])
-
-    # # mode = 'train' if train else "valid"
-    # mode = 'test'
-    # # dataset = get_video_dataset(ds, root, seq_len=timestep_horizon, mode=mode, image_size=image_size,tasks=config.get('tasks',None),views=views)
-    # dataset = RLBenchDataset2(root=root, 
-    #                 mode=mode, 
-    #                 ep_len=121,
-    #                 sample_length=timestep_horizon, 
-    #                 image_size=image_size,
-    #                 tiny=True,
-    #                 tasks=config.get('tasks',None),
-    #                 multiview=len(views)>1,
-    #                 views=views,
-    #                 actions=config.get('actions',None),
-    #                 convert_6D=config.get('convert_6D',False),
-    #                 language_condition=language_condition)
-    # batch_size = max(1, num_trajetories)
-    # dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, drop_last=False)
-    # batch = next(iter(dataloader))
-    # model_timestep_horizon = model.timestep_horizon
-    # cond_steps = model_timestep_horizon if cond_steps is None else cond_steps
-    # model.eval()
-    # x_horizon = batch[0][:, :timestep_horizon].to(device)
-    # actions_horizon = None if not action_condition else batch[1][:, :timestep_horizon].to(device)
-    
-    # # testing 
-    # x_horizon_new = torch.zeros_like(x_horizon)
-    # x_horizon_new[:,:cond_steps] = x_horizon[:,:cond_steps]
-    
-    # actions_horizon_new = torch.zeros_like(actions_horizon)
-    # actions_horizon_new[:,:cond_steps] = actions_horizon[:,:cond_steps]
-
-    
-    
-    # lang_str = None if not language_condition else batch[4]
-    # lang_embed = None if not language_condition else batch[5].to(device)
-    # x_goal = None if not img_goal_condition else batch[2].to(device)
-    
-    
-    
-    # if n_views > 1:
-    #     # expect: [bs, T, n_views, ...]
-    #     x_horizon = x_horizon.permute(0, 2, 1, 3, 4, 5)
-    #     x_horizon = x_horizon.reshape(-1, *x_horizon.shape[2:])  # [bs * n_views, T, ...]
-    #     x_horizon_new= x_horizon_new.permute(0, 2, 1, 3, 4, 5)
-    #     x_horizon_new = x_horizon_new.reshape(-1, *x_horizon_new.shape[2:])  # [bs * n_views, T, ...]
-        
-    #     if x_goal is not None:
-    #         x_goal = x_goal.reshape(-1, *x_goal.shape[2:])  #3 [bs * n_views, ...]
-    #     if actions_horizon is not None:
-    #         actions_horizon = actions_horizon.permute(0, 2, 1, 3)
-    #         actions_horizon = actions_horizon.reshape(-1, *actions_horizon.shape[2:])
-            
-    #         actions_horizon_new = actions_horizon_new.permute(0, 2, 1, 3)
-    #         actions_horizon_new = actions_horizon_new.reshape(-1, *actions_horizon_new.shape[2:])
+    """
+    Given data, generate a rollout and log actions and images
+    """
             
     # forward pass
     model_timestep_horizon = model.timestep_horizon
@@ -295,16 +235,6 @@ def build_rlbench_env(args: Arguments) -> RLBenchEnv:
     # RGB frames, so both are disabled here.
     """
     image_size = [int(x) for x in args.image_size.split(",")]
-    
-    # obs_config = ObservationConfig()
-    # obs_config.set_all(True)
-    
-    # obs_config.right_shoulder_camera.render_mode = RenderMode.OPENGL
-    # obs_config.left_shoulder_camera.render_mode = RenderMode.OPENGL
-    # obs_config.overhead_camera.render_mode = RenderMode.OPENGL
-    # obs_config.wrist_camera.render_mode = RenderMode.OPENGL
-    # obs_config.front_camera.render_mode = RenderMode.OPENGL
- 
  
     return RLBenchEnv(
         data_path=args.data_dir,
@@ -339,6 +269,7 @@ def extract_rgb_tensor(
     frames: List[torch.Tensor] = []
     for cam in camera_names:
         rgb_np: np.ndarray = getattr(obs, f"{cam}_rgb")  # (H, W, 3) uint8
+        assert rgb_np.shape[0] == 128
         if transform is not None:
             rgb = transform(rgb_np)  # ToTensor handles HWC->CHW and /255
         else:
@@ -753,6 +684,18 @@ def _reset_env_to_demo(task, demo) -> Tuple[List[str], Any]:
     return descriptions, obs
 
 
+def _embed(descriptions,device = 'cpu',max_length=32):
+    tokenizer = T5Tokenizer.from_pretrained('t5-large')
+    encoder = T5EncoderModel.from_pretrained('t5-large')
+    encoder.eval()
+    desc = descriptions[np.random.randint(len(descriptions))]
+    tokenized_desc = tokenizer(
+        desc, max_length=max_length,
+        padding='max_length', truncation=True, return_tensors='pt',
+    )
+    tokenized_desc = tokenized_desc['input_ids']
+    return encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(device)
+    
 @torch.no_grad()
 def run_episode(
     env: RLBenchEnv,
@@ -788,22 +731,23 @@ def run_episode(
     mover = Mover(task, max_tries=args.max_tries)
 
     # Language embedding: encode one of the task descriptions with T5.
-    desc: str = ""
     if model.language_condition:
-        tokenizer = T5Tokenizer.from_pretrained('t5-large')
-        encoder = T5EncoderModel.from_pretrained('t5-large')
-        encoder.eval()
-        desc = descriptions[np.random.randint(len(descriptions))]
-        tokenized_desc = tokenizer(
-            desc, max_length=model.language_max_len,
-            padding='max_length', truncation=True, return_tensors='pt',
-        )
-        tokenized_desc = tokenized_desc['input_ids']
-        language_goal = encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(device)
-        print(f"[DEBUG] using desc: {desc=} | {language_goal.median()=}")
+        # tokenizer = T5Tokenizer.from_pretrained('t5-large')
+        # encoder = T5EncoderModel.from_pretrained('t5-large')
+        # encoder.eval()
+        # desc = descriptions[np.random.randint(len(descriptions))]
+        # tokenized_desc = tokenizer(
+        #     desc, max_length=model.language_max_len,
+        #     padding='max_length', truncation=True, return_tensors='pt',
+        # )
+        # tokenized_desc = tokenized_desc['input_ids']
+        # language_goal = encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(device)
+        language_goal = _embed(descriptions=descriptions,device=device,max_length=model.language_max_len)
+        print(f"[DEBUG] using desc: {descriptions=} | {language_goal.median()=}")
     else:
         language_goal = None
 
+    
     max_reward, executed_steps, actions_history, last_rec, obs_history, imagination_history = _run_step_loop(
         task=task, mover=mover, initial_obs=obs,
         model=model, language_goal=language_goal, goal_tensor=goal_tensor,
@@ -822,7 +766,7 @@ def run_episode(
         obs_history=obs_history, executed_steps=executed_steps,
         task_str=task_str, demo_id=demo_id, cond_steps=args.cond_steps,
         output_dir=output_dir, gif_fps=args.gif_fps,
-        variation=variation_num, language_goal=desc,
+        variation=variation_num, language_goal=descriptions,
     )
 
     # Feed sim data into animate_trajectory_coparticle for offline diagnosis.
@@ -834,7 +778,7 @@ def run_episode(
     animate_trajectory_coparticle(
         model,
         x_horizon=x_horizon, actions_horizon=actions_horizon,
-        lang_embed=language_goal, lang_str=desc,
+        lang_embed=language_goal, lang_str=descriptions,
         epoch=variation_num, device=device, fig_dir=output_dir,
         timestep_horizon=args.max_steps // 2, num_trajetories=1,
         train=True, cond_steps=args.cond_steps, use_all_ctx=False,
@@ -920,10 +864,40 @@ def evaluate_task(
     env.env.launch()
     task_type = task_file_to_task_class(task_str)
     task = env.env.get_task(task_type)
+    
+    # run verification tests on pipeline
+    verifier = Verify(
+        build_image_transform=build_image_transform,
+        extract_rgb_tensor=extract_rgb_tensor,
+        get_gt_data=get_gt_data,
+        query_model=query_model,
+        _reset_env_to_demo=_reset_env_to_demo,
+        _run_step_loop=_run_step_loop,
+        embed=_embed,
+        env=env,
+        model=model,
+        task_str=task_str,
+        task=task,
+        args=args,
+        device=device,
+        logdir=output_dir,
+    )
+    verifier.test_1_replay_demo()
+    verifier.test_2_image_preprocessing()
+    verifier.test_3_action_preprocessing()
+    verifier.test_4_quant_conversion()
+    verifier.test_5_replay_open_loop() # @TODO fails because only executing one chunk
+    verifier.test_6_replay_recon()
+    verifier.test_7_replay_recon_with_ctx()
+    
+    
+    
     variations = _resolve_variations(env, task, task_str, args)
 
     var_successes: Dict[int, float] = {}
     var_counts: Dict[int, int] = {}
+    
+
 
     for variation in variations:
         total_success, num_valid = evaluate_one_variation(
@@ -981,6 +955,8 @@ def main() -> None:
     if args.tasks == []:
         raise Exception("No tasks specified!")
     
+    
+    
    
     
     for task_str in (args.tasks or []):
@@ -1007,6 +983,10 @@ if __name__ == "__main__":
 # potential hypotheses: we are not trained on intial obs but instead first actions 
 # hypothesis – unnormalized ?? 
 
+# @TODO check camera image quality
+# @TODO why does the ground truth look different
+# in slide_block_to_color_target_demo0 and stoch_0 / determ_0?
+
+
 # @TODO check cond_steps in evaluate script 
 # @TODO reduce action chunk based on reconstruction quality
-# @TODO check camera image quality
