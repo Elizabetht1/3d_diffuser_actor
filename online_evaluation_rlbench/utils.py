@@ -7,6 +7,7 @@ pipeline, so there is no risk of evaluating a different code path.
 import numpy as np
 import torch
 from typing import Optional, List, Tuple
+from tqdm import tqdm
 
 from utils.mover import Mover
 
@@ -22,6 +23,119 @@ from lpwm_dev.eval.eval_particle_dreamer import plot_actions
 import numpy as np
 
 
+def animate_trajectory_coparticle(model,
+                                  x_horizon, actions_horizon, lang_embed, lang_str, 
+                                  epoch, 
+                                  device=torch.device('cpu'), 
+                                  fig_dir='./', timestep_horizon=3,
+                            num_trajetories=5, accelerator=None, train=False, prefix='', cond_steps=None,
+                            deterministic=True, det_and_stoch=True, use_all_ctx=True,animation_fps = 10):
+    """
+    Given data, generate a rollout and log actions and images
+    """
+            
+    # forward pass
+    model_timestep_horizon = model.timestep_horizon
+    cond_steps = model_timestep_horizon if cond_steps is None else cond_steps
+    n_views = model.n_views
+    action_rec_1 = None
+    action_rec_2 = None
+    duration = animation_fps
+    
+    # push to device 
+    x_horizon = x_horizon[:, :timestep_horizon].float().to(device)
+    actions_horizon = actions_horizon[:, :timestep_horizon].float().to(device)
+    
+    
+    with torch.no_grad():
+        if det_and_stoch:
+            preds_1,action_rec_1,_,_= model.sample_from_x(x_horizon, num_steps=timestep_horizon - cond_steps, deterministic=True,
+                                          cond_steps=cond_steps, use_all_ctx=use_all_ctx, actions=actions_horizon,
+                                          lang_embed=lang_embed,return_aux_rec=True)
+            preds_2, action_rec_2, reward_rec, continue_rec = model.sample_from_x(x_horizon, num_steps=timestep_horizon - cond_steps, deterministic=False,
+                                          cond_steps=cond_steps, actions=actions_horizon, lang_embed=lang_embed,
+                                        return_aux_rec=True)
+            
+            # print(f"\n [INFO] median_actions={action_rec.mean(dim=1)} | max={action_rec.max(dim=1)} | min={action_rec.min(dim=1)} \n")
+        else:
+            preds_1 = model.sample_from_x(x_horizon, num_steps=timestep_horizon - cond_steps,
+                                          deterministic=deterministic,
+                                          cond_steps=cond_steps, actions=actions_horizon, lang_embed=lang_embed,
+                                          )
+            preds_2 = None
+        # preds: [bs, timestep_horizon, 3, im_size, im_size]
+   
+    for i in range(num_trajetories):
+        if n_views > 1:
+            x_horizon = x_horizon.reshape(-1, n_views, *x_horizon.shape[1:])
+            x_preds_1 = preds_1.reshape(-1, n_views, *preds_1.shape[1:])
+
+            gt_traj = x_horizon[i, 0].permute(0, 2, 3, 1).data.cpu().numpy()
+            pred_traj = x_preds_1[i, 0].permute(0, 2, 3, 1).data.cpu().numpy()
+
+            gt_traj_12 = x_horizon[i, 1].permute(0, 2, 3, 1).data.cpu().numpy()
+            pred_traj_12 = x_preds_1[i, 1].permute(0, 2, 3, 1).data.cpu().numpy()
+        else:
+            gt_traj = x_horizon[i].permute(0, 2, 3, 1).data.cpu().numpy()
+            pred_traj = preds_1[i].permute(0, 2, 3, 1).data.cpu().numpy()
+
+            gt_traj_12 = pred_traj_12 = None
+        lang_str_i = lang_str[i]
+
+        x_goal_i = x_goal_i2 = None
+        if det_and_stoch:
+            if n_views > 1:
+                x_preds_2 = preds_2.reshape(-1, n_views, *preds_2.shape[1:])
+                pred_traj_2 = x_preds_2[i, 0].permute(0, 2, 3, 1).data.cpu().numpy()
+                pred_traj_22 = x_preds_2[i, 1].permute(0, 2, 3, 1).data.cpu().numpy()
+            else:
+                pred_traj_2 = preds_2[i].permute(0, 2, 3, 1).data.cpu().numpy()
+                pred_traj_22 = None
+        else:
+            pred_traj_2 = pred_traj_22 = None
+            
+        # plot visual reconstruction quality
+        if accelerator is not None:
+            if accelerator.is_main_process:
+                animate_trajectories(gt_traj, pred_traj, pred_traj_2,
+                                     path=os.path.join(fig_dir, f'{prefix}e{epoch}_traj_anim_{i}.gif'),
+                                     duration=duration, 
+                                     rec_to_pred_t=cond_steps, 
+                                     t1='-D', t2='-S', title=lang_str_i,
+                                     goal_img=x_goal_i,
+                                     orig_trajectory2=gt_traj_12, pred_trajectory_12=pred_traj_12,
+                                     pred_trajectory_22=pred_traj_22, goal_img2=x_goal_i2)
+        else:
+            animate_trajectories(gt_traj, pred_traj, pred_traj_2,
+                                 path=os.path.join(fig_dir, f'{prefix}e{epoch}_traj_anim_{i}.gif'),
+                                 duration=duration, rec_to_pred_t=cond_steps, t1='-D', t2='-S', title=lang_str_i,
+                                 goal_img=x_goal_i, orig_trajectory2=gt_traj_12, pred_trajectory_12=pred_traj_12,
+                                 pred_trajectory_22=pred_traj_22, goal_img2=x_goal_i2)
+            
+        # plot action reconstruction quality
+        assert action_rec_2 is not None
+        assert action_rec_1 is not None
+        assert actions_horizon is not None
+        plot_actions(
+            gen_acts = action_rec_1.squeeze(),
+            gt_acts= actions_horizon.squeeze(),
+            timestep_horizon = timestep_horizon,
+            ndim = 10,
+            root = fig_dir,
+            id=f"determ_{epoch}"
+        )
+        
+        plot_actions(
+            gen_acts = action_rec_2.squeeze(),
+            gt_acts= actions_horizon.squeeze(),
+            timestep_horizon = timestep_horizon,
+            ndim = 10,
+            root = fig_dir,
+            id=f"stoch_{epoch}"
+        )
+    return preds_2, action_rec_2
+     
+
 class Verify2:
     """Diagnostic tests for the coparticle evaluation pipeline.
 
@@ -35,7 +149,7 @@ class Verify2:
         self,
         actioner,
         demo,
-        env=None,
+        env =None,
         task=None,
         task_str: str = "",
         max_steps: int = 25,
@@ -231,35 +345,74 @@ class Verify2:
         predicted actions without re-querying.
         """
         descs, obs = self._reset_env_to_demo(self.task, self.demo)
-        mover = Mover(self.task, max_tries=self.max_tries)
-        language_goal = self.actioner._instr
-
+        
         # @TODO implement me 
-        self.actioner.predict( ) 
-
+        state_dict, gripper = self.env.get_obs_action(obs) # should be an instace of RLBenchEnv
+        rgbs_input = [np.stack(state_dict['rgb'],axis=0)]  # (num_cameras, H, W, C)   
+        pcds_input = None
+        gripper_input = [gripper]
         T = self.gt_actions.shape[0]
+    
+                    
+        # @TODO reset to generate the whole trajectory
+        old_pred_steps = self.actioner.num_pred_steps 
+        
+        
+        self.actioner.load_episode(self.task_str, variation, descs)
+        
+        self.actioner.num_pred_steps = T
+        output = self.actioner.predict(
+                    rgbs_input,
+                    pcds_input,
+                    gripper_input
+        )
+        self.actioner.num_pred_steps = old_pred_steps
+        
+    
+        trajectory = output["trajectory"][-1].cpu().numpy()
+        trajectory[:, -1] = trajectory[:, -1].round()
+        del output  # free output['rgb'] (~2 GiB GPU tensor) before simulation
+        torch.cuda.empty_cache()
+
         plot_actions(
-            actions_history[:T],
+            trajectory[:T],
             self.gt_actions,
             T,
             ndim=8,
             id="test_5",
             root=self.logdir
         )
+        
+        max_reward = 0.0 
+        mover = Mover(self.task, max_tries=self.max_tries)
+        step_id = 0
+        for action in tqdm(trajectory):
+            collision_checking = self.env._collision_checking(self.task_str, step_id)
+            obs, reward, terminate, _ = mover(action, collision_checking=collision_checking)
+            max_reward = max(max_reward, reward)
+            
+            if terminate:
+                break 
+
 
         passed = max_reward == 1.0
         print(f"[test_5] {'PASS' if passed else 'FAIL'}: "
-              f"open-loop max_reward={max_reward:.2f} over {executed_steps} steps")
+              f"open-loop max_reward={max_reward:.2f} over {T} steps")
         return passed
 
-    def test_6_replay_recon(self, variation: int = 0, demo_id: int = 0):
+    def test_6_replay_recon(self):
         gt_actions, _, _ = self._get_gt_data(self.demo, self.cameras)
 
+    
         parsed_gt_actions = torch.from_numpy(gt_actions).float().to(self.device)
-        parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions).unsqueeze(1)
+        if self.convert_6D:
+            parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions)
+        parsed_gt_actions = parsed_gt_actions.unsqueeze(1)
         recon_actions = eval_action_recon(self.model, parsed_gt_actions, deterministic=True,
                                          plot=True, logdir=self.logdir, epoch=6, id="test_6")
-        recon_actions = action_ortho6d_to_xyzw(recon_actions).cpu().numpy()
+        if self.convert_6D:
+            recon_actions = action_ortho6d_to_xyzw(recon_actions)
+        recon_actions = recon_actions.cpu().numpy()
 
         _, obs = self._reset_env_to_demo(self.task, self.demo)
         mover = Mover(self.task, max_tries=self.max_tries)
@@ -281,13 +434,16 @@ class Verify2:
 
     def test_7_replay_recon_with_ctx(self, variation: int = 0, demo_id: int = 0):
         """Evaluate reconstruction fidelity with ground-truth latent context."""
+        
         desc, obs = self._reset_env_to_demo(self.task, self.demo)
         mover = Mover(self.task, max_tries=self.max_tries)
 
         T, adim = self.gt_actions.shape
 
         parsed_gt_actions = torch.from_numpy(self.gt_actions).float().to(self.device)
-        parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions).unsqueeze(0)
+        if self.convert_6D:
+            parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions)
+        parsed_gt_actions = parsed_gt_actions.unsqueeze(0)
 
         parsed_gt_frames = (
             torch.from_numpy(np.stack([self.gt_frames_cam0, self.gt_frames_cam1]))
@@ -320,7 +476,11 @@ class Verify2:
             else:
                 recon_actions = torch.cat([recon_actions, recon_actions_chunk], dim=1)
 
-        recon_actions = action_ortho6d_to_xyzw(recon_actions).squeeze().cpu().numpy()
+        if self.convert_6D:
+            recon_actions = action_ortho6d_to_xyzw(recon_actions)
+        recon_actions = recon_actions.squeeze().cpu().numpy()
+        del parsed_gt_frames  # free large GPU frame tensor before simulation
+        torch.cuda.empty_cache()
 
         reward = 0.0
         for action_np in recon_actions:
@@ -595,7 +755,7 @@ class Verify:
         
         demo = self._load_demo(variation, demo_id)
         gt_actions, _, _ = self._get_gt_data(demo, self.args.cameras)
-        
+       
         # generate the reconstruction to rollout 
         
         parsed_gt_actions = torch.from_numpy(gt_actions).float().to(self.device)

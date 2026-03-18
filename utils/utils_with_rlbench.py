@@ -1,7 +1,7 @@
 import os
 import glob
 import random
-from typing import List, Dict, Any, Sequence, Iterable
+from typing import List, Dict, Any, Sequence, Iterable, Tuple, Optional
 from pathlib import Path
 import json
 
@@ -26,7 +26,12 @@ from pyrep.const import RenderMode
 
 from lpwm_dev.rlbench_utils.geometry import action_ortho6d_to_xyzw,action_xyzw_to_ortho6d
 from transformers import T5Tokenizer, T5EncoderModel
-from online_evaluation_rlbench.utils import Verify2
+from online_evaluation_rlbench.utils import Verify2, animate_trajectory_coparticle
+from utils.mover import Mover
+from lpwm_dev.eval.eval_particle_dreamer import plot_actions
+from lpwm_dev.utils.util_func import animate_trajectories 
+from datetime import datetime
+
 
 
 ALL_RLBENCH_TASKS = [
@@ -114,14 +119,16 @@ class Actioner_Coparticle:
         )
         tokenized_desc = tokenized_desc['input_ids']
         with torch.no_grad():
-            return self._t5_encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device)
+            return self._t5_encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device), desc
+        
         
         
     def load_episode(self, task_str, variation, descriptions):
         self._task_str = task_str
-        self._instr = self._embed(descriptions)
+        self._instr, desc = self._embed(descriptions)
         self._task_id = torch.tensor(TASK_TO_ID[task_str]).unsqueeze(0)
         self._actions = {}
+        return desc
         
     def load_instruction(self):
         # @TODO implement me
@@ -218,7 +225,8 @@ class Actioner_Coparticle:
         Returns:
             {"action": None, "trajectory": np.ndarray}
         """
-        output = {"action": None, "trajectory": None}
+        torch.cuda.empty_cache()
+        output = {"action": None, "trajectory": None, "rgb": None}
 
         if self._instr is None:
             raise ValueError()
@@ -254,6 +262,8 @@ class Actioner_Coparticle:
             trajectory = action_rec
             # trajectory = action_rec.cpu().numpy()
             output['trajectory'] = trajectory
+            
+            output['rgb'] = rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
 
         return output
 
@@ -571,6 +581,7 @@ class RLBenchEnv:
         var_success_rates = {}
         var_num_valid_demos = {}
 
+        log_run = datetime.now().strftime("%m:%d:%Y_%I:%M_%p")
         for variation in task_variations:
             task.set_variation(variation)
             success_rate, valid, num_valid_demos = (
@@ -586,6 +597,7 @@ class RLBenchEnv:
                     dense_interpolation=dense_interpolation,
                     interpolation_length=interpolation_length,
                     num_history=num_history,
+                    log_run = log_run
                 )
             )
             if valid:
@@ -600,6 +612,24 @@ class RLBenchEnv:
         )
 
         return var_success_rates
+    
+    def _get_gt_data(
+        self,
+        demo,
+        camera_names: Tuple[str, ...],
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+            """Extract per-timestep GT actions and RGB frames from every demo step."""
+            gt_actions: List[np.ndarray] = []
+            frames_0: List[np.ndarray] = []
+            frames_1: List[np.ndarray] = []
+            for obs in demo:
+                gt_actions.append(np.concatenate([obs.gripper_pose, [obs.gripper_open]]))
+                frames_0.append(getattr(obs, f"{camera_names[0]}_rgb"))
+                if len(camera_names) >= 2:
+                    frames_1.append(getattr(obs, f"{camera_names[1]}_rgb"))
+            cam1 = np.stack(frames_1) if frames_1 else None
+            return np.stack(gt_actions), np.stack(frames_0), cam1
+
 
     @torch.no_grad()
     def _evaluate_task_on_one_variation(
@@ -616,6 +646,8 @@ class RLBenchEnv:
         interpolation_length=50,
         num_history=0,
         coparticle = True,
+        verify = False,
+        log_run = None
     ):
         device = actioner.device
 
@@ -623,6 +655,7 @@ class RLBenchEnv:
         num_valid_demos = 0
         total_reward = 0
 
+        log_run = log_run if log_run is not None else datetime.now().strftime("%m:%d:%Y_%I:%M_%p") # directory to store logs at 
         for demo_id in range(num_demos):
             if verbose:
                 print()
@@ -634,26 +667,30 @@ class RLBenchEnv:
             except:
                 continue
             
-            # verify
-            verifier = Verify2(
-                actioner=actioner,
-                demo=demo,
-                env=self,
-                task=task,
-                task_str=task_str,
-                max_steps=max_steps,
-                max_tries=max_tries,
-                verbose=verbose,
-                device=actioner.device,
-                logdir="eval_outputs"
-            )
-            verifier.test_1_replay_demo()
-            verifier.test_2_image_preprocessing()
-            verifier.test_3_action_preprocessing()
-            verifier.test_4_quant_conversion()
-            # verifier.test_5_replay_open_loop() # @TODO debug
-            verifier.test_6_replay_recon()
-            verifier.test_7_replay_recon_with_ctx()
+            # verify 
+            if verify: 
+                verifier = Verify2(
+                    actioner=actioner,
+                    demo=demo,
+                    env=self,
+                    task=task,
+                    task_str=task_str,
+                    max_steps=max_steps,
+                    max_tries=max_tries,
+                    verbose=verbose,
+                    device=actioner.device,
+                    logdir=f"eval_logs/{log_run}"
+                )
+                verifier.test_1_replay_demo()
+                verifier.test_2_image_preprocessing()
+                verifier.test_3_action_preprocessing()
+                verifier.test_4_quant_conversion()
+                verifier.test_5_replay_open_loop() # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
+                verifier.test_6_replay_recon()
+                verifier.test_7_replay_recon_with_ctx()
+                torch.cuda.empty_cache()
+            else:
+                print("[WARNING] skipping verification ... ")
             
             
 
@@ -664,10 +701,16 @@ class RLBenchEnv:
             # descriptions, obs = task.reset()
             descriptions, obs = task.reset_to_demo(demo)
 
-            actioner.load_episode(task_str, variation, descriptions)
+            desc = actioner.load_episode(task_str, variation, descriptions)
+            
             move = Mover(task, max_tries=max_tries)
             reward = 0.0
             max_reward = 0.0
+            
+            actions_history : List[np.ndarray] = []
+            frames_cam0 : List[np.ndarray] = []
+            frames_cam1 : List[np.ndarray] = []
+            imagination_frames = []
 
             for step_id in range(max_steps):
 
@@ -728,10 +771,12 @@ class RLBenchEnv:
                     if output.get("trajectory", None) is not None:
                         trajectory = output["trajectory"][-1].cpu().numpy()
                         trajectory[:, -1] = trajectory[:, -1].round()
+                        
+                        rgb_rec = output["rgb"].cpu().numpy()
+                        imagination_frames.append(rgb_rec)
 
                         # execute
                         for action in tqdm(trajectory):
-                            breakpoint()
                             #try:
                             #    collision_checking = self._collision_checking(task_str, step_id)
                             #    obs, reward, terminate, _ = move(action_np, collision_checking=collision_checking)
@@ -740,6 +785,13 @@ class RLBenchEnv:
                             #    pass
                             collision_checking = self._collision_checking(task_str, step_id)
                             obs, reward, terminate, _ = move(action, collision_checking=collision_checking)
+                            
+                            actions_history.append(action)
+                            
+                            state_dict, gripper = self.get_obs_action(obs)
+                            frames_cam0.append(state_dict['rgb'][0])
+                            frames_cam1.append(state_dict['rgb'][1])
+
 
                     # Or plan to reach next predicted keypoint
                     else:
@@ -782,6 +834,45 @@ class RLBenchEnv:
                 f"SR: {success_rate}/{demo_id+1}",
                 f"SR: {total_reward:.2f}/{demo_id+1}",
                 "# valid demos", num_valid_demos,
+            )
+            
+            
+            gt_actions, gt_cam0, gt_cam1 = self._get_gt_data(demo,actioner._apply_cameras) # @TODO don't make this verifier logic dependent
+
+            T1,adim = gt_actions.shape
+            T2 = len(actions_history)
+            T= min(T1,T2)
+            plot_actions(
+                actions_history[:T],
+                gt_actions[:T],
+                T,
+                ndim=adim,
+                id=f"{task_str}_v{variation}_d{demo_id}",
+                root=f"eval_logs/{log_run}"
+            )
+            
+            # comapre gt vs simulation rollouts 
+            frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
+            frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+            gt_cam0 = gt_cam0[:T] / 255.0
+            gt_cam1 = gt_cam1[:T] / 255.0
+            imagination_frames = np.concatenate(imagination_frames,axis=1)[:,:T]
+            imagination_cam0 = imagination_frames[0].transpose(0,2,3,1)
+            imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)
+            
+            animate_trajectories(
+                orig_trajectory=gt_cam0,
+                pred_trajectory=frames_cam0,
+                pred_trajectory_2 = imagination_cam0,
+                path=f'eval_logs/{log_run}/{task_str}_v{variation}_d{demo_id}_sim_rollout.gif',
+                duration=10, # @TODO don't hardcode
+                rec_to_pred_t=actioner.cond_steps,
+                t1="-Sim-Rollout",
+                t2="-Imagination",
+                title=f"GT vs Predicted - {desc}",
+                orig_trajectory2=gt_cam1, 
+                pred_trajectory_12=frames_cam1,
+                pred_trajectory_22= imagination_cam1
             )
 
         # Compensate for failed demos

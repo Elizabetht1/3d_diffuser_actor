@@ -176,6 +176,7 @@ def main_coparticle():
         raise NotImplementedError()
 
     model = build_model(args.config)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=torch.device('cpu')))
     
     with open(args.config,'r') as fin:
         config = json.load(fin)
