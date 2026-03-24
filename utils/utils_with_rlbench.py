@@ -24,12 +24,17 @@ from rlbench.demo import Demo
 from pyrep.errors import IKError, ConfigurationPathError
 from pyrep.const import RenderMode
 
+
+# NEW COPARTICLE UTILS
 from lpwm_dev.rlbench_utils.geometry import action_ortho6d_to_xyzw,action_xyzw_to_ortho6d
-from transformers import T5Tokenizer, T5EncoderModel
-from online_evaluation_rlbench.utils import Verify2, animate_trajectory_coparticle
-from utils.mover import Mover
+from lpwm_dev.utils.util_func import create_segmentation_map
 from lpwm_dev.eval.eval_particle_dreamer import plot_actions
 from lpwm_dev.utils.util_func import animate_trajectories 
+from transformers import T5Tokenizer, T5EncoderModel
+
+
+from online_evaluation_rlbench.utils import Verify2, animate_trajectory_coparticle
+from utils.mover import Mover
 from datetime import datetime
 
 
@@ -98,6 +103,7 @@ class Actioner_Coparticle:
         self._actions = {}
         self._instr = None
         self._task_str = None
+        self._desc = None
         self._convert_6D = convert_6D
         self._deterministic = deterministic
         
@@ -108,6 +114,7 @@ class Actioner_Coparticle:
         self._tokenizer = T5Tokenizer.from_pretrained('t5-large')
         self._t5_encoder = T5EncoderModel.from_pretrained('t5-large')
         self._t5_encoder.eval()
+        
 
         self._policy.eval()
 
@@ -128,6 +135,7 @@ class Actioner_Coparticle:
         self._instr, desc = self._embed(descriptions)
         self._task_id = torch.tensor(TASK_TO_ID[task_str]).unsqueeze(0)
         self._actions = {}
+        self._desc = desc
         return desc
         
     def load_instruction(self):
@@ -237,12 +245,12 @@ class Actioner_Coparticle:
         # perform all preprocessing
         
         rgbs = self._build_input_frames(rgbs)
-        rgbs = self._preprocess_frames(rgbs)
-        
+        rgbs = self._preprocess_frames(rgbs)    
         actions = self._preprocess_actions(actions)
         
 
         with torch.no_grad():
+            assert rgbs.min() >= 0 and rgbs.max() <= 1
             rec, action_rec, _, _ = self._policy.sample_from_x(
                 x=rgbs,
                 num_steps=self.num_pred_steps,
@@ -264,7 +272,7 @@ class Actioner_Coparticle:
             output['trajectory'] = trajectory
             
             output['rgb'] = rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
-
+         
         return output
 
     @property
@@ -646,7 +654,7 @@ class RLBenchEnv:
         interpolation_length=50,
         num_history=0,
         coparticle = True,
-        verify = False,
+        verify = True,
         log_run = None
     ):
         device = actioner.device
@@ -656,6 +664,8 @@ class RLBenchEnv:
         total_reward = 0
 
         log_run = log_run if log_run is not None else datetime.now().strftime("%m:%d:%Y_%I:%M_%p") # directory to store logs at 
+        os.makedirs(f"eval_logs/{log_run}",exist_ok=True)
+        
         for demo_id in range(num_demos):
             if verbose:
                 print()
@@ -681,13 +691,14 @@ class RLBenchEnv:
                     device=actioner.device,
                     logdir=f"eval_logs/{log_run}"
                 )
-                verifier.test_1_replay_demo()
-                verifier.test_2_image_preprocessing()
-                verifier.test_3_action_preprocessing()
-                verifier.test_4_quant_conversion()
-                verifier.test_5_replay_open_loop() # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
-                verifier.test_6_replay_recon()
-                verifier.test_7_replay_recon_with_ctx()
+                # verifier.test_1_replay_demo()
+                # verifier.test_2_image_preprocessing()
+                # verifier.test_3_action_preprocessing()
+                # verifier.test_4_quant_conversion()
+                verifier.test_5_replay_open_loop(variation=variation,demo_id=demo_id) # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
+                verifier.test_6_replay_recon(variation=variation,demo_id=demo_id)
+                verifier.test_7_replay_recon_with_ctx(variation=variation,demo_id=demo_id)
+                del verifier
                 torch.cuda.empty_cache()
             else:
                 print("[WARNING] skipping verification ... ")

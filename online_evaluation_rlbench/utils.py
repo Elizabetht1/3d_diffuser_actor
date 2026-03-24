@@ -10,6 +10,7 @@ from typing import Optional, List, Tuple
 from tqdm import tqdm
 
 from utils.mover import Mover
+from lpwm_dev.utils.util_func import create_segmentation_map
 
 
 from pyrep.errors import ConfigurationPathError, IKError
@@ -20,6 +21,7 @@ from rlbench.backend.exceptions import InvalidActionError
 from lpwm_dev.rlbench_utils.geometry import action_xyzw_to_ortho6d, action_ortho6d_to_xyzw
 from lpwm_dev.rlbench_utils.action_reconstructions import eval_action_recon 
 from lpwm_dev.eval.eval_particle_dreamer import plot_actions
+from lpwm_dev.utils.util_func import animate_trajectories 
 import numpy as np
 
 
@@ -157,6 +159,7 @@ class Verify2:
         verbose: bool = False,
         device: torch.device = torch.device("cpu"),
         logdir: str = "",
+        demo_id: int = 0,
     ):
         self.env = env
         self.model = actioner._policy
@@ -181,6 +184,8 @@ class Verify2:
         self.gt_actions, self.gt_frames_cam0, self.gt_frames_cam1 = self._get_gt_data(
             self.demo, camera_names=self.cameras
         )
+        
+        self._demo_id = demo_id
 
     # ----------------------------------------------------------- helpers
 
@@ -214,7 +219,8 @@ class Verify2:
         demo,
         camera_names: Tuple[str, ...],
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-        """Extract per-timestep GT actions and RGB frames from every demo step."""
+        
+        """Extract per-timestep GT actions and RGB frames from every demo step. output normalized versions. """
         gt_actions: List[np.ndarray] = []
         frames_0: List[np.ndarray] = []
         frames_1: List[np.ndarray] = []
@@ -223,8 +229,9 @@ class Verify2:
             frames_0.append(getattr(obs, f"{camera_names[0]}_rgb"))
             if len(camera_names) >= 2:
                 frames_1.append(getattr(obs, f"{camera_names[1]}_rgb"))
-        cam1 = np.stack(frames_1) if frames_1 else None
-        return np.stack(gt_actions), np.stack(frames_0), cam1
+        cam1 = np.stack(frames_1) / 255.0 if frames_1 else None
+        cam0 = np.stack(frames_0) / 255.0
+        return np.stack(gt_actions), cam0, cam1
 
     # ------------------------------------------------------------------ tests
 
@@ -348,7 +355,7 @@ class Verify2:
         
         # @TODO implement me 
         state_dict, gripper = self.env.get_obs_action(obs) # should be an instace of RLBenchEnv
-        rgbs_input = [np.stack(state_dict['rgb'],axis=0)]  # (num_cameras, H, W, C)   
+        rgbs_input = [np.stack(state_dict['rgb'],axis=0)]   # (num_cameras, H, W, C)   
         pcds_input = None
         gripper_input = [gripper]
         T = self.gt_actions.shape[0]
@@ -369,38 +376,80 @@ class Verify2:
         self.actioner.num_pred_steps = old_pred_steps
         
     
+        frames_cam0 : List[np.ndarray] = []
+        frames_cam1 : List[np.ndarray] = []
+        imagination_frames = []
+        
         trajectory = output["trajectory"][-1].cpu().numpy()
         trajectory[:, -1] = trajectory[:, -1].round()
+        rgb_rec = output["rgb"].cpu().numpy()
+        imagination_frames.append(rgb_rec)
+        
         del output  # free output['rgb'] (~2 GiB GPU tensor) before simulation
         torch.cuda.empty_cache()
 
-        plot_actions(
-            trajectory[:T],
-            self.gt_actions,
-            T,
-            ndim=8,
-            id="test_5",
-            root=self.logdir
-        )
+        
         
         max_reward = 0.0 
         mover = Mover(self.task, max_tries=self.max_tries)
         step_id = 0
+        
         for action in tqdm(trajectory):
             collision_checking = self.env._collision_checking(self.task_str, step_id)
             obs, reward, terminate, _ = mover(action, collision_checking=collision_checking)
             max_reward = max(max_reward, reward)
             
+            state_dict, gripper = self.env.get_obs_action(obs)
+            frames_cam0.append(state_dict['rgb'][0])
+            frames_cam1.append(state_dict['rgb'][1])
+                
             if terminate:
                 break 
+            
+        plot_actions(
+            trajectory[:T],
+            self.gt_actions,
+            T,
+            ndim=8,
+            id=f"test_5_{demo_id}",
+            root=self.logdir
+        )
+        
+    
+        
+        frames_cam0 = np.stack(frames_cam0) / 255.0
+        frames_cam1 = np.stack(frames_cam1) / 255.0
+        imagination_frames = np.concatenate(imagination_frames,axis=1)
+        imagination_cam0 = imagination_frames[0].transpose(0,2,3,1)
+        imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)
+        
+        max_ts = min(frames_cam0.shape[0],self.gt_frames_cam0.shape[0],imagination_cam0.shape[0])
+        
 
+        animate_trajectories(
+            orig_trajectory=self.gt_frames_cam0[:max_ts],
+            pred_trajectory=frames_cam0[:max_ts],
+            pred_trajectory_2 = imagination_cam0[:max_ts],
+            path=f'{self.logdir}/test_5_v{variation}_d{demo_id}_sim_rollout.gif',
+            duration=10,
+            rec_to_pred_t=self.actioner.cond_steps,
+            t1="-Sim-Rollout",
+            t2="-Imagination",
+            title=f"GT vs Predicted - {self.actioner._desc}",
+            orig_trajectory2=self.gt_frames_cam1[:max_ts],
+            pred_trajectory_12=frames_cam1[:max_ts],
+            pred_trajectory_22= imagination_cam1[:max_ts] 
+        )
+
+        # for visualization
+    
 
         passed = max_reward == 1.0
         print(f"[test_5] {'PASS' if passed else 'FAIL'}: "
               f"open-loop max_reward={max_reward:.2f} over {T} steps")
         return passed
 
-    def test_6_replay_recon(self):
+    def test_6_replay_recon(self, variation: int = 0, demo_id: int = 0,):
         gt_actions, _, _ = self._get_gt_data(self.demo, self.cameras)
 
     
@@ -418,15 +467,56 @@ class Verify2:
         mover = Mover(self.task, max_tries=self.max_tries)
 
         reward = 0.0
+        
+        frames_cam0 : List[np.ndarray] = []
+        frames_cam1 : List[np.ndarray] = []
+        
         for action_np in recon_actions:
             try:
                 obs, reward, terminate, _ = mover(action_np)
+
             except (IKError, ConfigurationPathError, InvalidActionError) as e:
                 print(f"[test_6] FAIL: execution error: {e}")
                 return False
+            
+            state_dict, gripper = self.env.get_obs_action(obs)
+            frames_cam0.append(state_dict['rgb'][0])
+            frames_cam1.append(state_dict['rgb'][1])
+            
             if reward == 1.0:
                 print("[test_6] PASS: demo replay achieved reward=1.0")
                 return True
+
+        # BEGIN VISUALIZATION 
+        T = self.gt_actions.shape[0]
+        
+        plot_actions(
+            recon_actions,
+            self.gt_actions,
+            T,
+            ndim=8,
+            id=f"test_6_v{variation}_d{demo_id}",
+            root=self.logdir
+        )
+        
+    
+        frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
+        frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+    
+        animate_trajectories(
+            orig_trajectory=self.gt_frames_cam0,
+            pred_trajectory=frames_cam0,
+            path=f'{self.logdir}/test_6_v{variation}_d{demo_id}_sim_rollout.gif',
+            duration=10,
+            rec_to_pred_t=self.actioner.cond_steps,
+            t1="-Sim-Rollout",
+            title=f"GT vs Predicted - {self.actioner._desc}",
+            orig_trajectory2=self.gt_frames_cam1, 
+            pred_trajectory_12=frames_cam1,
+        )
+        
+        # END VISUALIZATION 
+
 
         passed = reward == 1.0
         print(f"[test_6] {'PASS' if passed else 'FAIL'}: max_reward={reward:.2f}")
@@ -453,13 +543,17 @@ class Verify2:
         )
 
         lang_embed = self.actioner._instr
-        ts_horizon = T
+        ts_horizon = T # FORCE open loop, can optionally do closed loop 
 
         recon_actions = None
+        
+       
+        imagination_frames = []
+        
         for ts in range(0, T, ts_horizon):
             pred_horizon = min(T - ts, ts_horizon)
             with torch.no_grad():
-                _, recon_actions_chunk, _, _ = self.model.sample_from_x(
+                rec_rgb, recon_actions_chunk, _, _ = self.model.sample_from_x(
                     parsed_gt_frames[:, ts:ts + pred_horizon],
                     num_steps=pred_horizon,
                     deterministic=True,
@@ -470,11 +564,16 @@ class Verify2:
                     return_aux_rec=True,
                     n_pred_eq_gt=False,
                 )
+            
             recon_actions_chunk = recon_actions_chunk[:, self.cond_steps:]
+            recon_frames_chunk = rec_rgb[:,self.cond_steps:]
+            
             if recon_actions is None:
                 recon_actions = recon_actions_chunk
             else:
                 recon_actions = torch.cat([recon_actions, recon_actions_chunk], dim=1)
+                
+            imagination_frames.append(recon_frames_chunk) 
 
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
@@ -483,23 +582,60 @@ class Verify2:
         torch.cuda.empty_cache()
 
         reward = 0.0
+        
+        frames_cam0 : List[np.ndarray] = []
+        frames_cam1 : List[np.ndarray] = []
+        
         for action_np in recon_actions:
             try:
                 obs, reward, terminate, _ = mover(action_np)
             except (IKError, ConfigurationPathError, InvalidActionError) as e:
                 print(f"[test_7] FAIL: execution error: {e}")
                 return False
+            
+            
+            state_dict, gripper = self.env.get_obs_action(obs)
+            frames_cam0.append(state_dict['rgb'][0])
+            frames_cam1.append(state_dict['rgb'][1])
+            
             if reward == 1.0:
                 print("[test_7] PASS: demo replay achieved reward=1.0")
-                return True
+                break
 
         plot_actions(
             recon_actions.squeeze(),
             self.gt_actions.squeeze(),
             T,
             ndim=8,
-            id="test_7",
+            id=f"test_7_v{variation}_d{demo_id}",
             root=self.logdir
+        )
+        
+        frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
+        frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+        
+    
+        imagination_frames = torch.cat(imagination_frames,axis=1)
+        imagination_cam0 = imagination_frames[0].permute(0,2,3,1).detach().cpu().numpy()
+        imagination_cam1 = imagination_frames[1].permute(0,2,3,1).detach().cpu().numpy()
+        
+    
+        max_ts = min(frames_cam0.shape[0],self.gt_frames_cam0.shape[0],imagination_cam0.shape[0])
+        
+
+        animate_trajectories(
+            orig_trajectory=self.gt_frames_cam0[:max_ts],
+            pred_trajectory=frames_cam0[:max_ts],
+            pred_trajectory_2 = imagination_cam0[:max_ts],
+            path=f'{self.logdir}/test_7_v{variation}_d{demo_id}_sim_rollout.gif',
+            duration=10,
+            rec_to_pred_t=self.actioner.cond_steps,
+            t1="-Sim-Rollout",
+            t2="-Imagination",
+            title=f"GT vs Predicted - {self.actioner._desc}",
+            orig_trajectory2=self.gt_frames_cam1[:max_ts],
+            pred_trajectory_12=frames_cam1[:max_ts],
+            pred_trajectory_22= imagination_cam1[:max_ts] 
         )
 
         passed = reward == 1.0
