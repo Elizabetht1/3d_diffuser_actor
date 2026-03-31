@@ -405,10 +405,11 @@ class Verify2:
                 
             if terminate:
                 break 
-            
+        
+        
         plot_actions(
-            trajectory[:T],
-            self.gt_actions,
+            torch.from_numpy(trajectory[:T]),
+            torch.from_numpy(self.gt_actions),
             T,
             ndim=8,
             id=f"test_5_{demo_id}",
@@ -457,8 +458,10 @@ class Verify2:
         if self.convert_6D:
             parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions)
         parsed_gt_actions = parsed_gt_actions.unsqueeze(1)
-        recon_actions = eval_action_recon(self.model, parsed_gt_actions, deterministic=True,
-                                         plot=True, logdir=self.logdir, epoch=6, id="test_6")
+        recon_actions = eval_action_recon(self.model, parsed_gt_actions, 
+                                          deterministic=True, 
+                                          logdir=self.logdir, epoch=6, id=f"test_6_v{variation}_d{demo_id}",
+                                          plot=True)
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
         recon_actions = recon_actions.cpu().numpy()
@@ -490,14 +493,14 @@ class Verify2:
         # BEGIN VISUALIZATION 
         T = self.gt_actions.shape[0]
         
-        plot_actions(
-            recon_actions,
-            self.gt_actions,
-            T,
-            ndim=8,
-            id=f"test_6_v{variation}_d{demo_id}",
-            root=self.logdir
-        )
+        # plot_actions(
+        #     recon_actions,
+        #     self.gt_actions,
+        #     T,
+        #     ndim=8,
+        #     id=f"test_6_v{variation}_d{demo_id}",
+        #     root=self.logdir
+        # )
         
     
         frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
@@ -603,8 +606,8 @@ class Verify2:
                 break
 
         plot_actions(
-            recon_actions.squeeze(),
-            self.gt_actions.squeeze(),
+            torch.from_numpy(recon_actions.squeeze()),
+            torch.from_numpy(self.gt_actions.squeeze()),
             T,
             ndim=8,
             id=f"test_7_v{variation}_d{demo_id}",

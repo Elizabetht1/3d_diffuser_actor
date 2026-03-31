@@ -26,7 +26,12 @@ from pyrep.const import RenderMode
 
 
 # NEW COPARTICLE UTILS
-from lpwm_dev.rlbench_utils.geometry import action_ortho6d_to_xyzw,action_xyzw_to_ortho6d
+from lpwm_dev.rlbench_utils.geometry import (
+    action_ortho6d_to_xyzw,
+    action_xyzw_to_ortho6d,
+    normalize_pos,
+    unnormalize_pos,
+    get_gripper_loc_bounds)
 from lpwm_dev.utils.util_func import create_segmentation_map
 from lpwm_dev.eval.eval_particle_dreamer import plot_actions
 from lpwm_dev.utils.util_func import animate_trajectories 
@@ -93,6 +98,7 @@ class Actioner_Coparticle:
         cond_steps=1,
         deterministic=True,
         max_length = 12,
+        gripper_loc_bounds = None
     ):
         self._policy = policy
         self._instructions = instructions
@@ -111,13 +117,23 @@ class Actioner_Coparticle:
         self.cond_steps = cond_steps
         self._max_length = max_length
         
+        
         self._tokenizer = T5Tokenizer.from_pretrained('t5-large')
         self._t5_encoder = T5EncoderModel.from_pretrained('t5-large')
         self._t5_encoder.eval()
         
 
         self._policy.eval()
+        
+        if gripper_loc_bounds is None:
+            raise ValueError("Must specify gripper location bounds")
+    
+    
 
+        self.gripper_loc_bounds = torch.tensor(gripper_loc_bounds)
+      
+    
+       
     def _embed(self, descriptions):
         desc = descriptions[np.random.randint(len(descriptions))]
         tokenized_desc = self._tokenizer(
@@ -172,15 +188,15 @@ class Actioner_Coparticle:
         
         # handle multiview reshaping
         n_views = self._policy.n_views
-        if n_views > 1:
-            if not frames_tensor.shape[2] == n_views:
-                raise ValueError("frames do not have correct dimensionality")
-            
-            
-            frames_tensor = frames_tensor.permute(0, 2, 1, 3, 4, 5)
-            frames_tensor = frames_tensor.reshape(-1, *frames_tensor.shape[2:])  # [bs * n_views, T, ...]
+        
+        if not frames_tensor.shape[2] == n_views:
+            raise ValueError("frames do not have correct dimensionality")
         
         
+        frames_tensor = frames_tensor.permute(0, 2, 1, 3, 4, 5)
+        frames_tensor = frames_tensor.reshape(-1, *frames_tensor.shape[2:])  # [bs * n_views, T, ...]
+
+
     
         return frames_tensor
     
@@ -207,6 +223,9 @@ class Actioner_Coparticle:
         # convert dims as needed
         if self._convert_6D:
             actions = action_xyzw_to_ortho6d(actions)
+            
+        # normalize
+        actions[...,:3] = normalize_pos(actions[...,:3], gripper_loc_bounds=self.gripper_loc_bounds)
         
         
         # pad as needed 
@@ -248,7 +267,6 @@ class Actioner_Coparticle:
         rgbs = self._preprocess_frames(rgbs)    
         actions = self._preprocess_actions(actions)
         
-
         with torch.no_grad():
             assert rgbs.min() >= 0 and rgbs.max() <= 1
             rec, action_rec, _, _ = self._policy.sample_from_x(
@@ -262,8 +280,14 @@ class Actioner_Coparticle:
                 actions=actions,
                 lang_embed=self._instr
             )
+            
+            # action post processing
+            # handle conversion from 6D to quarterion 
             if self._convert_6D:
                 action_rec = action_ortho6d_to_xyzw(action_rec)
+                
+            # undo position normalization
+            action_rec[...,:3] = unnormalize_pos(action_rec[...,:3], gripper_loc_bounds=self.gripper_loc_bounds)
             
             # ignore the appended reconstructions
             action_rec = action_rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
@@ -654,7 +678,7 @@ class RLBenchEnv:
         interpolation_length=50,
         num_history=0,
         coparticle = True,
-        verify = True,
+        verify = False,
         log_run = None
     ):
         device = actioner.device
@@ -691,10 +715,10 @@ class RLBenchEnv:
                     device=actioner.device,
                     logdir=f"eval_logs/{log_run}"
                 )
-                # verifier.test_1_replay_demo()
-                # verifier.test_2_image_preprocessing()
-                # verifier.test_3_action_preprocessing()
-                # verifier.test_4_quant_conversion()
+                verifier.test_1_replay_demo()
+                verifier.test_2_image_preprocessing()
+                verifier.test_3_action_preprocessing()
+                verifier.test_4_quant_conversion()
                 verifier.test_5_replay_open_loop(variation=variation,demo_id=demo_id) # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
                 verifier.test_6_replay_recon(variation=variation,demo_id=demo_id)
                 verifier.test_7_replay_recon_with_ctx(variation=variation,demo_id=demo_id)
@@ -854,8 +878,8 @@ class RLBenchEnv:
             T2 = len(actions_history)
             T= min(T1,T2)
             plot_actions(
-                actions_history[:T],
-                gt_actions[:T],
+                torch.Tensor(actions_history[:T]),
+                torch.from_numpy(gt_actions[:T]),
                 T,
                 ndim=adim,
                 id=f"{task_str}_v{variation}_d{demo_id}",

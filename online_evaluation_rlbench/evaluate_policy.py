@@ -13,9 +13,10 @@ from diffuser_actor.keypose_optimization.act3d import Act3D
 from diffuser_actor.trajectory_optimization.diffuser_actor import DiffuserActor
 from utils.common_utils import (
     load_instructions,
-    get_gripper_loc_bounds,
+    # get_gripper_loc_bounds,
     round_floats
 )
+from lpwm_dev.rlbench_utils.geometry import get_gripper_loc_bounds
 from utils.utils_with_rlbench import RLBenchEnv, Actioner, load_episodes, Actioner_Coparticle
 from lpwm_dev.model_factory import build_model 
 
@@ -146,6 +147,7 @@ def load_models(args):
 
 def main_coparticle():
     
+
     # Arguments
     args = Arguments().parse_args()
     args.cameras = tuple(x for y in args.cameras for x in y.split(","))
@@ -160,7 +162,7 @@ def main_coparticle():
     np.random.seed(args.seed)
     random.seed(args.seed)
     
-     # Load RLBench environment
+    # Load RLBench environment
     env = RLBenchEnv(
         data_path=args.data_dir,
         image_size=[int(x) for x in args.image_size.split(",")],
@@ -170,6 +172,8 @@ def main_coparticle():
         apply_cameras=args.cameras,
         collision_checking=bool(args.collision_checking)
     )
+    
+    
 
     instruction = load_instructions(args.instructions)
     if instruction is None:
@@ -180,6 +184,13 @@ def main_coparticle():
     
     with open(args.config,'r') as fin:
         config = json.load(fin)
+        
+    # load workspace bounds
+    print('Gripper workspace')
+    gripper_loc_bounds = get_gripper_loc_bounds(
+        args.gripper_loc_bounds_file,
+        task=args.tasks, buffer=args.gripper_loc_bounds_buffer,
+    )
     
     actioner = Actioner_Coparticle(
         policy=model,
@@ -189,7 +200,8 @@ def main_coparticle():
         num_pred_steps=config['timestep_horizon'],
         cond_steps = config['cond_steps'],
         deterministic=True,
-        max_length=config['language_max_len']
+        max_length=config['language_max_len'],
+        gripper_loc_bounds = gripper_loc_bounds
     )
     
     max_eps_dict = load_episodes()["max_episode_length"]
