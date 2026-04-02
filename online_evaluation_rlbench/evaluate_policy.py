@@ -4,6 +4,7 @@ from typing import Tuple, Optional
 from pathlib import Path
 import json
 import os
+import traceback
 
 import torch
 import numpy as np
@@ -72,6 +73,8 @@ class Arguments(tap.Tap):
     use_instruction: int = 1
     rotation_parametrization: str = '6D'
     quaternion_format: str = 'xyzw'
+    
+    verify: int = 1
 
 
 def load_models(args):
@@ -134,7 +137,10 @@ def load_models(args):
         raise NotImplementedError
 
     # Load model weights
-    model_dict = torch.load(args.checkpoint, map_location="cpu")
+    try:
+        model_dict = torch.load(args.checkpoint, map_location="cpu")
+    except:
+        breakpoint()
     model_dict_weight = {}
     for key in model_dict["weight"]:
         _key = key[7:]
@@ -156,6 +162,7 @@ def main_coparticle():
     print("-" * 100)
     # Save results here
     Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
+    
 
     # Seeds
     torch.manual_seed(args.seed)
@@ -179,9 +186,17 @@ def main_coparticle():
     if instruction is None:
         raise NotImplementedError()
 
-    model = build_model(args.config)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=torch.device('cpu')))
-    
+
+    model = build_model(config_path=args.config,device=args.device)
+    state_dict = torch.load(args.checkpoint, map_location=torch.device('cpu'))
+    state_dict = {(k[len('module.'):] if k.startswith('module.') else k): v for k, v in state_dict.items()} # if accelerator
+
+    try:
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        exit()
+   
+        
     with open(args.config,'r') as fin:
         config = json.load(fin)
         
@@ -221,7 +236,8 @@ def main_coparticle():
             dense_interpolation=bool(args.dense_interpolation),
             interpolation_length=args.interpolation_length,
             verbose=bool(args.verbose),
-            num_history=args.num_history
+            num_history=args.num_history,
+            verify=args.verify
         )
         print()
         print(

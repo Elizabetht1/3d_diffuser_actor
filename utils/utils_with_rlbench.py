@@ -292,7 +292,7 @@ class Actioner_Coparticle:
             # ignore the appended reconstructions
             action_rec = action_rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
             trajectory = action_rec
-            # trajectory = action_rec.cpu().numpy()
+            
             output['trajectory'] = trajectory
             
             output['rgb'] = rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
@@ -597,6 +597,7 @@ class RLBenchEnv:
         dense_interpolation=False,
         interpolation_length=100,
         num_history=1,
+        verify=True
     ):
         self.env.launch()
         task_type = task_file_to_task_class(task_str)
@@ -629,7 +630,8 @@ class RLBenchEnv:
                     dense_interpolation=dense_interpolation,
                     interpolation_length=interpolation_length,
                     num_history=num_history,
-                    log_run = log_run
+                    log_run = log_run,
+                    verify=verify
                 )
             )
             if valid:
@@ -678,7 +680,7 @@ class RLBenchEnv:
         interpolation_length=50,
         num_history=0,
         coparticle = True,
-        verify = False,
+        verify = True,
         log_run = None
     ):
         device = actioner.device
@@ -742,10 +744,14 @@ class RLBenchEnv:
             reward = 0.0
             max_reward = 0.0
             
+            use_second_cam = len(self.apply_cameras) > 1
+            
             actions_history : List[np.ndarray] = []
             frames_cam0 : List[np.ndarray] = []
-            frames_cam1 : List[np.ndarray] = []
+            frames_cam1 : Optional[List[np.ndarray]] = [] if use_second_cam else None
             imagination_frames = []
+            
+            
 
             for step_id in range(max_steps):
 
@@ -825,7 +831,8 @@ class RLBenchEnv:
                             
                             state_dict, gripper = self.get_obs_action(obs)
                             frames_cam0.append(state_dict['rgb'][0])
-                            frames_cam1.append(state_dict['rgb'][1])
+                            if use_second_cam:
+                                frames_cam1.append(state_dict['rgb'][1])
 
 
                     # Or plan to reach next predicted keypoint
@@ -888,12 +895,19 @@ class RLBenchEnv:
             
             # comapre gt vs simulation rollouts 
             frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
-            frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+            
             gt_cam0 = gt_cam0[:T] / 255.0
-            gt_cam1 = gt_cam1[:T] / 255.0
+            
             imagination_frames = np.concatenate(imagination_frames,axis=1)[:,:T]
             imagination_cam0 = imagination_frames[0].transpose(0,2,3,1)
-            imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)
+            
+            if use_second_cam:
+                frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+                gt_cam1 = gt_cam1[:T] / 255.0
+                imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)
+            else: 
+                frames_cam1 = gt_cam1 = imagination_cam1 = None
+            
             
             animate_trajectories(
                 orig_trajectory=gt_cam0,

@@ -18,8 +18,8 @@ from rlbench.backend.exceptions import InvalidActionError
 
 
 # coparticle utils
-from lpwm_dev.rlbench_utils.geometry import action_xyzw_to_ortho6d, action_ortho6d_to_xyzw
-from lpwm_dev.rlbench_utils.action_reconstructions import eval_action_recon 
+from lpwm_dev.rlbench_utils.geometry import action_xyzw_to_ortho6d, action_ortho6d_to_xyzw, unnormalize_pos, normalize_pos
+from lpwm_dev.rlbench_utils.action_reconstructions import eval_action_recon, eval_action_recon2
 from lpwm_dev.eval.eval_particle_dreamer import plot_actions
 from lpwm_dev.utils.util_func import animate_trajectories 
 import numpy as np
@@ -160,6 +160,7 @@ class Verify2:
         device: torch.device = torch.device("cpu"),
         logdir: str = "",
         demo_id: int = 0,
+        location_normalization : bool = True
     ):
         self.env = env
         self.model = actioner._policy
@@ -186,6 +187,7 @@ class Verify2:
         )
         
         self._demo_id = demo_id
+        self.loc_norm = location_normalization
 
     # ----------------------------------------------------------- helpers
 
@@ -394,14 +396,23 @@ class Verify2:
         mover = Mover(self.task, max_tries=self.max_tries)
         step_id = 0
         
+        use_second_cam = len(self.env.apply_cameras) > 1
+       
+        
         for action in tqdm(trajectory):
             collision_checking = self.env._collision_checking(self.task_str, step_id)
-            obs, reward, terminate, _ = mover(action, collision_checking=collision_checking)
+            try:
+                obs, reward, terminate, _ = mover(action)
+            except (IKError, ConfigurationPathError, InvalidActionError) as e:
+                print(f"[test_5] FAIL: execution error: {e}")
+                return False
+  
             max_reward = max(max_reward, reward)
             
             state_dict, gripper = self.env.get_obs_action(obs)
             frames_cam0.append(state_dict['rgb'][0])
-            frames_cam1.append(state_dict['rgb'][1])
+            if use_second_cam:
+                frames_cam1.append(state_dict['rgb'][1])
                 
             if terminate:
                 break 
@@ -419,12 +430,23 @@ class Verify2:
     
         
         frames_cam0 = np.stack(frames_cam0) / 255.0
-        frames_cam1 = np.stack(frames_cam1) / 255.0
+        if use_second_cam:
+            frames_cam1 = np.stack(frames_cam1) / 255.0
+        else:
+            frames_cam1 = None
+        
         imagination_frames = np.concatenate(imagination_frames,axis=1)
         imagination_cam0 = imagination_frames[0].transpose(0,2,3,1)
-        imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)
-        
         max_ts = min(frames_cam0.shape[0],self.gt_frames_cam0.shape[0],imagination_cam0.shape[0])
+        
+        if use_second_cam:
+            imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)[:max_ts] 
+            frames_cam1 = frames_cam1[:max_ts]
+            self.gt_frames_cam1 = self.gt_frames_cam1[:max_ts]
+        else: 
+            imagination_cam1 = None
+        
+        
         
 
         animate_trajectories(
@@ -437,9 +459,9 @@ class Verify2:
             t1="-Sim-Rollout",
             t2="-Imagination",
             title=f"GT vs Predicted - {self.actioner._desc}",
-            orig_trajectory2=self.gt_frames_cam1[:max_ts],
-            pred_trajectory_12=frames_cam1[:max_ts],
-            pred_trajectory_22= imagination_cam1[:max_ts] 
+            orig_trajectory2=self.gt_frames_cam1,
+            pred_trajectory_12=frames_cam1,
+            pred_trajectory_22= imagination_cam1
         )
 
         # for visualization
@@ -457,14 +479,27 @@ class Verify2:
         parsed_gt_actions = torch.from_numpy(gt_actions).float().to(self.device)
         if self.convert_6D:
             parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions)
+            
+        if self.loc_norm:
+            parsed_gt_actions[...,:3] = normalize_pos(pos= parsed_gt_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+            
+        if parsed_gt_actions.min() < -1 - 1e-6 or parsed_gt_actions.max() > 1 + 1e6:
+            print("[WARNING] actions are NOT normalized.\n")
         parsed_gt_actions = parsed_gt_actions.unsqueeze(1)
-        recon_actions = eval_action_recon(self.model, parsed_gt_actions, 
+        recon_actions = eval_action_recon2(self.model, parsed_gt_actions, 
                                           deterministic=True, 
-                                          logdir=self.logdir, epoch=6, id=f"test_6_v{variation}_d{demo_id}",
-                                          plot=True)
+                                          logdir=self.logdir, 
+                                          id=f"test_6_v{variation}_d{demo_id}")
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
-        recon_actions = recon_actions.cpu().numpy()
+            
+        # # handle undo normalization
+        if self.loc_norm:
+            recon_actions[...,:3] = unnormalize_pos(pos= recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+        
+
+            
+        recon_actions = recon_actions.cpu().numpy().squeeze()
 
         _, obs = self._reset_env_to_demo(self.task, self.demo)
         mover = Mover(self.task, max_tries=self.max_tries)
@@ -472,7 +507,10 @@ class Verify2:
         reward = 0.0
         
         frames_cam0 : List[np.ndarray] = []
-        frames_cam1 : List[np.ndarray] = []
+        
+        use_second_cam = len(self.env.apply_cameras) > 1
+         
+        frames_cam1 : Optional[List[np.ndarray]] = [] if use_second_cam else None 
         
         for action_np in recon_actions:
             try:
@@ -484,14 +522,17 @@ class Verify2:
             
             state_dict, gripper = self.env.get_obs_action(obs)
             frames_cam0.append(state_dict['rgb'][0])
-            frames_cam1.append(state_dict['rgb'][1])
+            if use_second_cam:
+                frames_cam1.append(state_dict['rgb'][1])
             
             if reward == 1.0:
-                print("[test_6] PASS: demo replay achieved reward=1.0")
-                return True
+                # print("[test_6] PASS: demo replay achieved reward=1.0")
+                break
+                # return True
 
         # BEGIN VISUALIZATION 
-        T = self.gt_actions.shape[0]
+        T = min(self.gt_actions.shape[0],len(frames_cam0)) 
+        # if we succeed earlier than end of demo, retrieved frames could be shorter
         
         # plot_actions(
         #     recon_actions,
@@ -504,11 +545,13 @@ class Verify2:
         
     
         frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
-        frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+        if use_second_cam:
+            frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+            self.gt_frames_cam1 = self.gt_frames_cam1[:T]
     
         animate_trajectories(
-            orig_trajectory=self.gt_frames_cam0,
-            pred_trajectory=frames_cam0,
+            orig_trajectory=self.gt_frames_cam0[:T],
+            pred_trajectory=frames_cam0[:T],
             path=f'{self.logdir}/test_6_v{variation}_d{demo_id}_sim_rollout.gif',
             duration=10,
             rec_to_pred_t=self.actioner.cond_steps,
@@ -536,14 +579,28 @@ class Verify2:
         parsed_gt_actions = torch.from_numpy(self.gt_actions).float().to(self.device)
         if self.convert_6D:
             parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions)
+            
+        if self.loc_norm:
+            parsed_gt_actions[...,:3] = normalize_pos(pos=parsed_gt_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+            
         parsed_gt_actions = parsed_gt_actions.unsqueeze(0)
 
-        parsed_gt_frames = (
-            torch.from_numpy(np.stack([self.gt_frames_cam0, self.gt_frames_cam1]))
+        use_second_camera = len(self.env.apply_cameras) > 1
+        
+        if use_second_camera:
+            parsed_gt_frames = (
+                torch.from_numpy(np.stack([self.gt_frames_cam0, self.gt_frames_cam1]))
+                .float()
+                .permute(0, 1, 4, 2, 3)
+                .to(self.device)
+            )
+        else: 
+            parsed_gt_frames = (torch.from_numpy(self.gt_frames_cam0)
             .float()
-            .permute(0, 1, 4, 2, 3)
+            .permute(0,3,1,2) # permute channel dimension correctly
+            .unsqueeze(0)
             .to(self.device)
-        )
+            )
 
         lang_embed = self.actioner._instr
         ts_horizon = T # FORCE open loop, can optionally do closed loop 
@@ -580,6 +637,10 @@ class Verify2:
 
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
+        if self.loc_norm:
+            recon_actions[...,:3] = unnormalize_pos(pos=recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+           
+           
         recon_actions = recon_actions.squeeze().cpu().numpy()
         del parsed_gt_frames  # free large GPU frame tensor before simulation
         torch.cuda.empty_cache()
@@ -587,7 +648,7 @@ class Verify2:
         reward = 0.0
         
         frames_cam0 : List[np.ndarray] = []
-        frames_cam1 : List[np.ndarray] = []
+        frames_cam1 : Optional[List[np.ndarray]] = [] if use_second_camera else None 
         
         for action_np in recon_actions:
             try:
@@ -599,7 +660,8 @@ class Verify2:
             
             state_dict, gripper = self.env.get_obs_action(obs)
             frames_cam0.append(state_dict['rgb'][0])
-            frames_cam1.append(state_dict['rgb'][1])
+            if use_second_camera:
+                frames_cam1.append(state_dict['rgb'][1])
             
             if reward == 1.0:
                 print("[test_7] PASS: demo replay achieved reward=1.0")
@@ -615,15 +677,23 @@ class Verify2:
         )
         
         frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
-        frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
+        if use_second_camera:
+            frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
         
     
         imagination_frames = torch.cat(imagination_frames,axis=1)
         imagination_cam0 = imagination_frames[0].permute(0,2,3,1).detach().cpu().numpy()
-        imagination_cam1 = imagination_frames[1].permute(0,2,3,1).detach().cpu().numpy()
+        imagination_cam1 = None 
+        
+        max_ts = min(frames_cam0.shape[0],self.gt_frames_cam0.shape[0],imagination_cam0.shape[0])
+          
+        if use_second_camera:
+            imagination_cam1 = imagination_frames[1].permute(0,2,3,1).detach().cpu().numpy()[:max_ts] 
+            frames_cam1 = frames_cam1[:max_ts]
+            self.gt_frames_cam1 = self.gt_frames_cam1[:max_ts] 
         
     
-        max_ts = min(frames_cam0.shape[0],self.gt_frames_cam0.shape[0],imagination_cam0.shape[0])
+      
         
 
         animate_trajectories(
@@ -636,9 +706,9 @@ class Verify2:
             t1="-Sim-Rollout",
             t2="-Imagination",
             title=f"GT vs Predicted - {self.actioner._desc}",
-            orig_trajectory2=self.gt_frames_cam1[:max_ts],
-            pred_trajectory_12=frames_cam1[:max_ts],
-            pred_trajectory_22= imagination_cam1[:max_ts] 
+            orig_trajectory2=self.gt_frames_cam1,
+            pred_trajectory_12=frames_cam1,
+            pred_trajectory_22= imagination_cam1
         )
 
         passed = reward == 1.0
