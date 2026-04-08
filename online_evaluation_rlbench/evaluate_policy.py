@@ -20,6 +20,7 @@ from utils.common_utils import (
 from lpwm_dev.rlbench_utils.geometry import get_gripper_loc_bounds
 from utils.utils_with_rlbench import RLBenchEnv, Actioner, load_episodes, Actioner_Coparticle
 from lpwm_dev.model_factory import build_model 
+from lpwm_dev.rlbench_utils.normalization import EefActionNormalizer
 
 class Arguments(tap.Tap):
     config: Path = ""
@@ -202,9 +203,16 @@ def main_coparticle():
         
     # load workspace bounds
     print('Gripper workspace')
-    gripper_loc_bounds = get_gripper_loc_bounds(
-        args.gripper_loc_bounds_file,
-        task=args.tasks, buffer=args.gripper_loc_bounds_buffer,
+    gripper_loc_bounds = None
+    # gripper_loc_bounds, gripper_open_bounds = get_gripper_loc_bounds(
+    #     args.gripper_loc_bounds_file,
+    #     task=args.tasks, buffer=args.gripper_loc_bounds_buffer,
+    # )
+    normalizer = None
+    normalizer = EefActionNormalizer(
+        tasks_bounds_file=args.gripper_loc_bounds_file,
+        tasks = args.tasks,
+        task_bounds_buffer=args.gripper_loc_bounds_buffer,
     )
     
     actioner = Actioner_Coparticle(
@@ -212,17 +220,23 @@ def main_coparticle():
         apply_cameras=args.cameras,
         action_dim=args.action_dim,
         convert_6D=config['convert_6D'],
-        num_pred_steps=config['timestep_horizon'],
+        num_pred_steps=5,
         cond_steps = config['cond_steps'],
         deterministic=True,
         max_length=config['language_max_len'],
-        gripper_loc_bounds = gripper_loc_bounds
+        normalizer=normalizer,
+        gripper_loc_bounds=gripper_loc_bounds,
+        instructions=instruction
     )
     
     max_eps_dict = load_episodes()["max_episode_length"]
     task_success_rates = {}
 
     for task_str in args.tasks:
+        max_steps = max_eps_dict[task_str] if args.max_steps == -1 else args.max_steps
+        if max_steps < 300:
+            print(f"[WARNING] max_steps = {max_steps} | Potential for truncated rollout")
+            
         var_success_rates = env.evaluate_task_on_multiple_variations(
             task_str,
             max_steps=(

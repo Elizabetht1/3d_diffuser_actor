@@ -20,7 +20,7 @@ from rlbench.backend.exceptions import InvalidActionError
 # coparticle utils
 from lpwm_dev.rlbench_utils.geometry import action_xyzw_to_ortho6d, action_ortho6d_to_xyzw, unnormalize_pos, normalize_pos
 from lpwm_dev.rlbench_utils.action_reconstructions import eval_action_recon, eval_action_recon2
-from lpwm_dev.eval.eval_particle_dreamer import plot_actions
+from lpwm_dev.rlbench_utils.plot import plot_actions
 from lpwm_dev.utils.util_func import animate_trajectories 
 import numpy as np
 
@@ -119,20 +119,16 @@ def animate_trajectory_coparticle(model,
         assert action_rec_1 is not None
         assert actions_horizon is not None
         plot_actions(
-            gen_acts = action_rec_1.squeeze(),
-            gt_acts= actions_horizon.squeeze(),
-            timestep_horizon = timestep_horizon,
-            ndim = 10,
-            root = fig_dir,
+            recon_actions = action_rec_1.squeeze(),
+            gt_actions= actions_horizon.squeeze(),
+            logdir = fig_dir,
             id=f"determ_{epoch}"
         )
         
         plot_actions(
-            gen_acts = action_rec_2.squeeze(),
-            gt_acts= actions_horizon.squeeze(),
-            timestep_horizon = timestep_horizon,
-            ndim = 10,
-            root = fig_dir,
+            recon_actions = action_rec_2.squeeze(),
+            gt_actions= actions_horizon.squeeze(),
+            logdir = fig_dir,
             id=f"stoch_{epoch}"
         )
     return preds_2, action_rec_2
@@ -160,7 +156,8 @@ class Verify2:
         device: torch.device = torch.device("cpu"),
         logdir: str = "",
         demo_id: int = 0,
-        location_normalization : bool = True
+        location_normalization : bool = True,
+        normalizer = None
     ):
         self.env = env
         self.model = actioner._policy
@@ -188,6 +185,8 @@ class Verify2:
         
         self._demo_id = demo_id
         self.loc_norm = location_normalization
+        
+        self._normalizer = normalizer
 
     # ----------------------------------------------------------- helpers
 
@@ -419,12 +418,10 @@ class Verify2:
         
         
         plot_actions(
-            torch.from_numpy(trajectory[:T]),
-            torch.from_numpy(self.gt_actions),
-            T,
-            ndim=8,
+            torch.from_numpy(trajectory[:T]).unsqueeze(0),
+            torch.from_numpy(self.gt_actions).unsqueeze(0),
             id=f"test_5_{demo_id}",
-            root=self.logdir
+            logdir=self.logdir
         )
         
     
@@ -473,6 +470,9 @@ class Verify2:
         return passed
 
     def test_6_replay_recon(self, variation: int = 0, demo_id: int = 0,):
+        
+        desc, obs = self._reset_env_to_demo(self.task, self.demo)
+        self.actioner.load_episode(self.task_str, variation, desc)
         gt_actions, _, _ = self._get_gt_data(self.demo, self.cameras)
 
     
@@ -480,25 +480,36 @@ class Verify2:
         if self.convert_6D:
             parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions)
             
-        if self.loc_norm:
+        
+        if self.loc_norm and self._normalizer is not None:
+            parsed_gt_actions = self._normalizer.normalize(parsed_gt_actions.cpu().numpy())
+            parsed_gt_actions = torch.from_numpy(parsed_gt_actions).float().to(self.device)
+        elif self.loc_norm:
             parsed_gt_actions[...,:3] = normalize_pos(pos= parsed_gt_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+        else:
+            ValueError("[WARNING] no normalization applied")
             
         if parsed_gt_actions.min() < -1 - 1e-6 or parsed_gt_actions.max() > 1 + 1e6:
             print("[WARNING] actions are NOT normalized.\n")
-        parsed_gt_actions = parsed_gt_actions.unsqueeze(1)
+        # parsed_gt_actions = parsed_gt_actions.unsqueeze(1)
         recon_actions = eval_action_recon2(self.model, parsed_gt_actions, 
                                           deterministic=True, 
-                                          logdir=self.logdir, 
-                                          id=f"test_6_v{variation}_d{demo_id}")
+                                          logdir=self.logdir)
+      
+            
+        # handle undo normalization
+        if self.loc_norm and self._normalizer is not None:
+            recon_actions = self._normalizer.unnormalize(recon_actions.cpu().numpy())
+            recon_actions = torch.from_numpy(recon_actions).float().to(self.device)
+        elif self.loc_norm:
+            recon_actions[...,:3] = unnormalize_pos(pos= recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+        else:
+            ValueError("[WARNING] no normalization applied")
+            
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
-            
-        # # handle undo normalization
-        if self.loc_norm:
-            recon_actions[...,:3] = unnormalize_pos(pos= recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
         
 
-            
         recon_actions = recon_actions.cpu().numpy().squeeze()
 
         _, obs = self._reset_env_to_demo(self.task, self.demo)
@@ -526,29 +537,29 @@ class Verify2:
                 frames_cam1.append(state_dict['rgb'][1])
             
             if reward == 1.0:
-                # print("[test_6] PASS: demo replay achieved reward=1.0")
                 break
-                # return True
 
         # BEGIN VISUALIZATION 
         T = min(self.gt_actions.shape[0],len(frames_cam0)) 
         # if we succeed earlier than end of demo, retrieved frames could be shorter
         
-        # plot_actions(
-        #     recon_actions,
-        #     self.gt_actions,
-        #     T,
-        #     ndim=8,
-        #     id=f"test_6_v{variation}_d{demo_id}",
-        #     root=self.logdir
-        # )
+
         
     
         frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
         if use_second_cam:
             frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
             self.gt_frames_cam1 = self.gt_frames_cam1[:T]
-    
+            
+
+        plot_actions(
+            recon_actions=np.expand_dims(recon_actions,axis=0),
+            gt_actions=np.expand_dims(self.gt_actions,axis=0),
+            id=f"test_6_v{variation}_d{demo_id}",
+            logdir=self.logdir
+        )
+            
+            
         animate_trajectories(
             orig_trajectory=self.gt_frames_cam0[:T],
             pred_trajectory=frames_cam0[:T],
@@ -556,7 +567,7 @@ class Verify2:
             duration=10,
             rec_to_pred_t=self.actioner.cond_steps,
             t1="-Sim-Rollout",
-            title=f"GT vs Predicted - {self.actioner._desc}",
+            title=f"GT vs Predicted - {desc[0]}",
             orig_trajectory2=self.gt_frames_cam1, 
             pred_trajectory_12=frames_cam1,
         )
@@ -572,6 +583,7 @@ class Verify2:
         """Evaluate reconstruction fidelity with ground-truth latent context."""
         
         desc, obs = self._reset_env_to_demo(self.task, self.demo)
+        self.actioner.load_episode(self.task_str, variation, desc)
         mover = Mover(self.task, max_tries=self.max_tries)
 
         T, adim = self.gt_actions.shape
@@ -580,8 +592,13 @@ class Verify2:
         if self.convert_6D:
             parsed_gt_actions = action_xyzw_to_ortho6d(parsed_gt_actions)
             
-        if self.loc_norm:
-            parsed_gt_actions[...,:3] = normalize_pos(pos=parsed_gt_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+        if self.loc_norm and self._normalizer is not None:
+            parsed_gt_actions = self._normalizer.normalize(parsed_gt_actions.cpu().numpy())
+            parsed_gt_actions = torch.from_numpy(parsed_gt_actions).float().to(self.device)
+        elif self.loc_norm:
+            parsed_gt_actions[...,:3] = normalize_pos(pos= parsed_gt_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+        else:
+            ValueError("[WARNING] no normalization applied")
             
         parsed_gt_actions = parsed_gt_actions.unsqueeze(0)
 
@@ -635,11 +652,18 @@ class Verify2:
                 
             imagination_frames.append(recon_frames_chunk) 
 
+     
+        
+        if self.loc_norm and self._normalizer is not None:
+            recon_actions = self._normalizer.unnormalize(recon_actions.cpu().numpy())
+            recon_actions = torch.from_numpy(recon_actions).float()
+        elif self.loc_norm:
+            recon_actions[...,:3] = unnormalize_pos(pos= recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
+        else:
+            ValueError("[WARNING] no normalization applied")
+            
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
-        if self.loc_norm:
-            recon_actions[...,:3] = unnormalize_pos(pos=recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
-           
            
         recon_actions = recon_actions.squeeze().cpu().numpy()
         del parsed_gt_frames  # free large GPU frame tensor before simulation
@@ -668,12 +692,10 @@ class Verify2:
                 break
 
         plot_actions(
-            torch.from_numpy(recon_actions.squeeze()),
-            torch.from_numpy(self.gt_actions.squeeze()),
-            T,
-            ndim=8,
+            torch.from_numpy(recon_actions).unsqueeze(0),
+            torch.from_numpy(self.gt_actions).unsqueeze(0),
             id=f"test_7_v{variation}_d{demo_id}",
-            root=self.logdir
+            logdir=self.logdir
         )
         
         frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
@@ -949,9 +971,7 @@ class Verify:
             actions_history[:T],
             gt_actions,
             T,
-            ndim=8,
             id="test_5",
-            root=self.logdir
         )
 
 
@@ -1059,9 +1079,7 @@ class Verify:
             recon_actions.squeeze(),
             gt_actions.squeeze(),
             T,
-            ndim=8,
             id="test_7",
-            root=self.logdir
         )
 
         passed = reward == 1.0

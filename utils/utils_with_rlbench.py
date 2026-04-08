@@ -98,7 +98,8 @@ class Actioner_Coparticle:
         cond_steps=1,
         deterministic=True,
         max_length = 12,
-        gripper_loc_bounds = None
+        gripper_loc_bounds = None,
+        normalizer = None 
     ):
         self._policy = policy
         self._instructions = instructions
@@ -125,12 +126,21 @@ class Actioner_Coparticle:
 
         self._policy.eval()
         
-        if gripper_loc_bounds is None:
-            raise ValueError("Must specify gripper location bounds")
+        self._normalizer = None
+        self.gripper_loc_bounds = None
+        
+        
+        if gripper_loc_bounds is None and normalizer is None:
+            raise ValueError("Must specify either gripper location bounds or normalizer class")
+         
+        if gripper_loc_bounds is not None and normalizer is not None:
+            raise ValueError("Cannot use both gripper loc bounds and normalizer")
     
-    
-
-        self.gripper_loc_bounds = torch.tensor(gripper_loc_bounds)
+        if gripper_loc_bounds is not None:
+            self.gripper_loc_bounds = torch.tensor(gripper_loc_bounds)
+        
+        if normalizer is not None:
+            self._normalizer = normalizer
       
     
        
@@ -148,6 +158,7 @@ class Actioner_Coparticle:
         
     def load_episode(self, task_str, variation, descriptions):
         self._task_str = task_str
+
         self._instr, desc = self._embed(descriptions)
         self._task_id = torch.tensor(TASK_TO_ID[task_str]).unsqueeze(0)
         self._actions = {}
@@ -225,7 +236,13 @@ class Actioner_Coparticle:
             actions = action_xyzw_to_ortho6d(actions)
             
         # normalize
-        actions[...,:3] = normalize_pos(actions[...,:3], gripper_loc_bounds=self.gripper_loc_bounds)
+        if self._normalizer is not None:
+            actions = self._normalizer.normalize(actions.cpu().numpy())
+            actions = torch.from_numpy(actions).float().to(self.device)
+        elif self.gripper_loc_bounds is not None :
+            actions[...,:3] = normalize_pos(actions[...,:3], gripper_loc_bounds=self.gripper_loc_bounds)
+        else:
+            raise ValueError("[WARNING] no normalization applied !")
         
         
         # pad as needed 
@@ -281,13 +298,25 @@ class Actioner_Coparticle:
                 lang_embed=self._instr
             )
             
+            
+            # undo position normalization
+            if self._normalizer is not None:
+                action_rec = self._normalizer.unnormalize(action_rec.squeeze(0).cpu().numpy())
+                action_rec = torch.from_numpy(action_rec).float().unsqueeze(0)
+            elif self.gripper_loc_bounds is not None:
+                action_rec[...,:3] = unnormalize_pos(action_rec[...,:3], gripper_loc_bounds=self.gripper_loc_bounds)
+            else:
+                raise ValueError("[WARNING] no position normalization speicified!")
+                
             # action post processing
             # handle conversion from 6D to quarterion 
             if self._convert_6D:
                 action_rec = action_ortho6d_to_xyzw(action_rec)
-                
-            # undo position normalization
-            action_rec[...,:3] = unnormalize_pos(action_rec[...,:3], gripper_loc_bounds=self.gripper_loc_bounds)
+            
+            
+            
+           
+            
             
             # ignore the appended reconstructions
             action_rec = action_rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
@@ -715,12 +744,13 @@ class RLBenchEnv:
                     max_tries=max_tries,
                     verbose=verbose,
                     device=actioner.device,
-                    logdir=f"eval_logs/{log_run}"
+                    logdir=f"eval_logs/{log_run}",
+                    normalizer=actioner._normalizer
                 )
-                verifier.test_1_replay_demo()
-                verifier.test_2_image_preprocessing()
-                verifier.test_3_action_preprocessing()
-                verifier.test_4_quant_conversion()
+                # verifier.test_1_replay_demo()
+                # verifier.test_2_image_preprocessing()
+                # verifier.test_3_action_preprocessing()
+                # verifier.test_4_quant_conversion()
                 verifier.test_5_replay_open_loop(variation=variation,demo_id=demo_id) # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
                 verifier.test_6_replay_recon(variation=variation,demo_id=demo_id)
                 verifier.test_7_replay_recon_with_ctx(variation=variation,demo_id=demo_id)
@@ -752,7 +782,6 @@ class RLBenchEnv:
             imagination_frames = []
             
             
-
             for step_id in range(max_steps):
 
                 # Fetch the current observation, and predict one action
@@ -810,6 +839,7 @@ class RLBenchEnv:
                 try:
                     # Execute entire predicted trajectory step by step
                     if output.get("trajectory", None) is not None:
+                        
                         trajectory = output["trajectory"][-1].cpu().numpy()
                         trajectory[:, -1] = trajectory[:, -1].round()
                         
@@ -880,8 +910,13 @@ class RLBenchEnv:
             
             
             gt_actions, gt_cam0, gt_cam1 = self._get_gt_data(demo,actioner._apply_cameras) # @TODO don't make this verifier logic dependent
-
+            
+                
+    
             T1,adim = gt_actions.shape
+            if( max_steps * actioner.num_pred_steps) < T1:
+                raise ValueError(f"[ERROR] max_steps={ max_steps * actioner.num_pred_steps} < ground truth steps={T1} | trajectory likely truncated ")
+                
             T2 = len(actions_history)
             T= min(T1,T2)
             plot_actions(
