@@ -11,7 +11,10 @@ class Arguments(tap.Tap):
 
 
 def main(root_dir, task):
-    variations = os.listdir(f'{root_dir}/{task}/all_variations/episodes')
+    fp = f'{root_dir}/{task}/all_variations/episodes'
+    if not os.path.exists(fp):
+        return
+    variations = os.listdir(fp)
     seen_variations = {}
     for variation in variations:
         num = int(variation.replace('episode', ''))

@@ -4,6 +4,7 @@ from typing import Tuple, Optional
 from pathlib import Path
 import json
 import os
+import shutil
 import traceback
 
 import torch
@@ -21,7 +22,7 @@ from lpwm_dev.rlbench_utils.geometry import get_gripper_loc_bounds
 from utils.utils_with_rlbench import RLBenchEnv, Actioner, load_episodes, Actioner_Coparticle
 from lpwm_dev.model_factory import build_model 
 from lpwm_dev.rlbench_utils.normalization import EefActionNormalizer
-
+from datetime import datetime
 class Arguments(tap.Tap):
     config: Path = ""
     checkpoint: Path = ""
@@ -76,6 +77,16 @@ class Arguments(tap.Tap):
     quaternion_format: str = 'xyzw'
     
     verify: int = 1
+    embed_type : str = 't5'
+
+
+def save_script_snapshot(log_run):
+    """Save a snapshot of eval_peract_coparticle.sh next to the output file."""
+    repo_root = Path(__file__).parent.parent
+    script_path = Path(__file__).parent / "eval_peract_coparticle.sh"
+    dest = os.path.join(repo_root,'eval_logs',log_run,"eval_peract_coparticle.sh") 
+    if script_path.exists():
+        shutil.copy2(script_path, dest)
 
 
 def load_models(args):
@@ -162,8 +173,10 @@ def main_coparticle():
     print(args)
     print("-" * 100)
     # Save results here
-    Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
-    
+    log_run = datetime.now().strftime("%m:%d:%Y_%I:%M_%p")
+    out_root = os.path.join(Path(__file__).parent.parent,'eval_logs',log_run)
+    os.makedirs(out_root,exist_ok=True)
+    save_script_snapshot(log_run)
 
     # Seeds
     torch.manual_seed(args.seed)
@@ -195,6 +208,7 @@ def main_coparticle():
     try:
         model.load_state_dict(state_dict)
     except Exception as e:
+        print(e)
         exit()
    
         
@@ -220,18 +234,20 @@ def main_coparticle():
         apply_cameras=args.cameras,
         action_dim=args.action_dim,
         convert_6D=config['convert_6D'],
-        num_pred_steps=5,
+        num_pred_steps=config['timestep_horizon'],
         cond_steps = config['cond_steps'],
         deterministic=True,
         max_length=config['language_max_len'],
         normalizer=normalizer,
         gripper_loc_bounds=gripper_loc_bounds,
-        instructions=instruction
+        instructions=instruction,
+        embed_type=args.embed_type
     )
     
     max_eps_dict = load_episodes()["max_episode_length"]
     task_success_rates = {}
 
+   
     for task_str in args.tasks:
         max_steps = max_eps_dict[task_str] if args.max_steps == -1 else args.max_steps
         if max_steps < 300:
@@ -251,7 +267,8 @@ def main_coparticle():
             interpolation_length=args.interpolation_length,
             verbose=bool(args.verbose),
             num_history=args.num_history,
-            verify=args.verify
+            verify=args.verify,
+            log_run = log_run
         )
         print()
         print(

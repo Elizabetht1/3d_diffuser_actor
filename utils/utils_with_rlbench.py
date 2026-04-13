@@ -36,6 +36,7 @@ from lpwm_dev.utils.util_func import create_segmentation_map
 from lpwm_dev.eval.eval_particle_dreamer import plot_actions
 from lpwm_dev.utils.util_func import animate_trajectories 
 from transformers import T5Tokenizer, T5EncoderModel
+from lpwm_dev.datasets.rlbench_preperation import load_preprocessing_models
 
 
 from online_evaluation_rlbench.utils import Verify2, animate_trajectory_coparticle
@@ -99,7 +100,8 @@ class Actioner_Coparticle:
         deterministic=True,
         max_length = 12,
         gripper_loc_bounds = None,
-        normalizer = None 
+        normalizer = None,
+        embed_type = 't5'
     ):
         self._policy = policy
         self._instructions = instructions
@@ -119,9 +121,13 @@ class Actioner_Coparticle:
         self._max_length = max_length
         
         
-        self._tokenizer = T5Tokenizer.from_pretrained('t5-large')
-        self._t5_encoder = T5EncoderModel.from_pretrained('t5-large')
-        self._t5_encoder.eval()
+        self.embed_type  = embed_type
+        if embed_type == 't5':
+            self._tokenizer = T5Tokenizer.from_pretrained('t5-large')
+            self._encoder = T5EncoderModel.from_pretrained('t5-large')
+            self._encoder.eval()
+        else: 
+            self._tokenizer, self._encoder, device = load_preprocessing_models(embed_type)
         
 
         self._policy.eval()
@@ -143,8 +149,17 @@ class Actioner_Coparticle:
             self._normalizer = normalizer
       
     
-       
-    def _embed(self, descriptions):
+    def _embed_clip(self, descriptions):
+        desc = descriptions[np.random.randint(len(descriptions))]
+        tokens = self._tokenizer(desc, padding="max_length")["input_ids"]
+        tokens = torch.tensor(tokens).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            pred = self._encoder(tokens).last_hidden_state.squeeze(0).float()
+
+        
+        return pred, desc
+            
+    def _embed_t5(self, descriptions):
         desc = descriptions[np.random.randint(len(descriptions))]
         tokenized_desc = self._tokenizer(
             desc, max_length=self._max_length,
@@ -152,9 +167,15 @@ class Actioner_Coparticle:
         )
         tokenized_desc = tokenized_desc['input_ids']
         with torch.no_grad():
-            return self._t5_encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device), desc
+            return self._encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device), desc
         
-        
+    def _embed(self,descriptions):
+        if self.embed_type == 't5':
+            return self._embed_t5(descriptions)
+        elif self.embed_type == 'clip':
+            return self._embed_clip(descriptions)
+        else:
+            raise ValueError("embedding type not supported")
         
     def load_episode(self, task_str, variation, descriptions):
         self._task_str = task_str
@@ -277,6 +298,7 @@ class Actioner_Coparticle:
 
         self._instr = self._instr.to(self.device)
         self._task_id = self._task_id.to(self.device)
+        
 
         # perform all preprocessing
         
@@ -410,6 +432,7 @@ class Actioner:
             raise ValueError()
 
         self._instr = self._instr.to(rgbs.device)
+        # self._instr = None 
         self._task_id = self._task_id.to(rgbs.device)
 
         # Predict trajectory
@@ -626,7 +649,8 @@ class RLBenchEnv:
         dense_interpolation=False,
         interpolation_length=100,
         num_history=1,
-        verify=True
+        verify=True,
+        log_run = None
     ):
         self.env.launch()
         task_type = task_file_to_task_class(task_str)
@@ -642,8 +666,6 @@ class RLBenchEnv:
 
         var_success_rates = {}
         var_num_valid_demos = {}
-
-        log_run = datetime.now().strftime("%m:%d:%Y_%I:%M_%p")
         for variation in task_variations:
             task.set_variation(variation)
             success_rate, valid, num_valid_demos = (
@@ -747,7 +769,7 @@ class RLBenchEnv:
                     logdir=f"eval_logs/{log_run}",
                     normalizer=actioner._normalizer
                 )
-                # verifier.test_1_replay_demo()
+                verifier.test_1_replay_demo()
                 # verifier.test_2_image_preprocessing()
                 # verifier.test_3_action_preprocessing()
                 # verifier.test_4_quant_conversion()
@@ -847,7 +869,7 @@ class RLBenchEnv:
                         imagination_frames.append(rgb_rec)
 
                         # execute
-                        for action in tqdm(trajectory):
+                        for action in trajectory:
                             #try:
                             #    collision_checking = self._collision_checking(task_str, step_id)
                             #    obs, reward, terminate, _ = move(action_np, collision_checking=collision_checking)
