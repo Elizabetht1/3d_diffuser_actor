@@ -630,7 +630,7 @@ class Verify2:
         for ts in range(0, T, ts_horizon):
             pred_horizon = min(T - ts, ts_horizon)
             with torch.no_grad():
-                rec_rgb, recon_actions_chunk, _, _ = self.model.sample_from_x(
+                res = self.model.sample_from_x(
                     parsed_gt_frames[:, ts:ts + pred_horizon],
                     num_steps=pred_horizon,
                     deterministic=True,
@@ -641,6 +641,8 @@ class Verify2:
                     return_aux_rec=True,
                     n_pred_eq_gt=False,
                 )
+                rec_rgb = res[0] 
+                recon_actions_chunk = res[1]
             
             recon_actions_chunk = recon_actions_chunk[:, self.cond_steps:]
             recon_frames_chunk = rec_rgb[:,self.cond_steps:]

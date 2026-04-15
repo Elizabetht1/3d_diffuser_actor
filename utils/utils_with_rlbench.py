@@ -7,6 +7,7 @@ import json
 
 import open3d
 import traceback
+from PIL import Image
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -127,7 +128,7 @@ class Actioner_Coparticle:
             self._encoder = T5EncoderModel.from_pretrained('t5-large')
             self._encoder.eval()
         else: 
-            self._tokenizer, self._encoder, device = load_preprocessing_models(embed_type)
+            self._tokenizer, self._encoder, device = load_preprocessing_models(embed_type,device=self.device)
         
 
         self._policy.eval()
@@ -168,8 +169,9 @@ class Actioner_Coparticle:
         tokenized_desc = tokenized_desc['input_ids']
         with torch.no_grad():
             return self._encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device), desc
-        
+    
     def _embed(self,descriptions):
+        
         if self.embed_type == 't5':
             return self._embed_t5(descriptions)
         elif self.embed_type == 'clip':
@@ -181,6 +183,7 @@ class Actioner_Coparticle:
         self._task_str = task_str
 
         self._instr, desc = self._embed(descriptions)
+
         self._task_id = torch.tensor(TASK_TO_ID[task_str]).unsqueeze(0)
         self._actions = {}
         self._desc = desc
@@ -308,7 +311,7 @@ class Actioner_Coparticle:
         
         with torch.no_grad():
             assert rgbs.min() >= 0 and rgbs.max() <= 1
-            rec, action_rec, _, _ = self._policy.sample_from_x(
+            res = self._policy.sample_from_x(
                 x=rgbs,
                 num_steps=self.num_pred_steps,
                 cond_steps=self.cond_steps,
@@ -319,6 +322,8 @@ class Actioner_Coparticle:
                 actions=actions,
                 lang_embed=self._instr
             )
+            rec = res[0]
+            action_rec = res[1]
             
             
             # undo position normalization
@@ -649,7 +654,7 @@ class RLBenchEnv:
         dense_interpolation=False,
         interpolation_length=100,
         num_history=1,
-        verify=True,
+        verify=False,
         log_run = None
     ):
         self.env.launch()
@@ -731,7 +736,7 @@ class RLBenchEnv:
         interpolation_length=50,
         num_history=0,
         coparticle = True,
-        verify = True,
+        verify = False,
         log_run = None
     ):
         device = actioner.device
@@ -804,6 +809,8 @@ class RLBenchEnv:
             imagination_frames = []
             
             
+  
+            
             for step_id in range(max_steps):
 
                 # Fetch the current observation, and predict one action
@@ -812,6 +819,8 @@ class RLBenchEnv:
                     rgbs_input = [np.stack(state_dict['rgb'],axis=0)]  # (num_cameras, H, W, C)   
                     pcds_input = None
                     gripper_input = [gripper]
+                    
+                    
                 
                 else: 
                     rgb, pcd, gripper = self.get_rgb_pcd_gripper_from_obs(obs)
@@ -844,7 +853,13 @@ class RLBenchEnv:
                                 gripper_input, (0, 0, npad, 0), mode='replicate'
                             )
 
-                
+                if step_id == 0:
+                    # Save initial simulation and GT frames
+                    initial_sim_frame = rgbs_input[0][0]
+                    initial_gt_frame = getattr(demo[0], f"{self.apply_cameras[0]}_rgb")
+                    Image.fromarray(initial_sim_frame).save(f'eval_logs/{log_run}/{task_str}_v{variation}_d{demo_id}_initial_sim.png')
+                    Image.fromarray(initial_gt_frame).save(f'eval_logs/{log_run}/{task_str}_v{variation}_d{demo_id}_initial_gt.png')
+
                 output = actioner.predict(
                     rgbs_input,
                     pcds_input,
@@ -852,8 +867,8 @@ class RLBenchEnv:
                     interpolation_length=interpolation_length
                 )
 
-                if verbose:
-                    print(f"Step {step_id}")
+                # if verbose:
+                #     print(f"Step {step_id}")
 
                 terminate = True
 
@@ -1055,8 +1070,8 @@ class RLBenchEnv:
             move = Mover(task, max_tries=max_tries)
 
             for step_id, action in enumerate(gt_keyframe_actions):
-                if verbose:
-                    print(f"Step {step_id}")
+                # if verbose:
+                #     print(f"Step {step_id}")
 
                 try:
                     obs, reward, terminate, step_images = move(action)

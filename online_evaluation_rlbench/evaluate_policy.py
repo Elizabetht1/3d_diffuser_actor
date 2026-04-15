@@ -173,7 +173,7 @@ def main_coparticle():
     print(args)
     print("-" * 100)
     # Save results here
-    log_run = datetime.now().strftime("%m:%d:%Y_%I:%M_%p")
+    log_run = datetime.now().strftime("%m:%d:%Y.%f_%I:%M_%p")
     out_root = os.path.join(Path(__file__).parent.parent,'eval_logs',log_run)
     os.makedirs(out_root,exist_ok=True)
     save_script_snapshot(log_run)
@@ -343,7 +343,8 @@ def main_3ddfa():
             dense_interpolation=bool(args.dense_interpolation),
             interpolation_length=args.interpolation_length,
             verbose=bool(args.verbose),
-            num_history=args.num_history
+            num_history=args.num_history,
+            verify=False
         )
         print()
         print(

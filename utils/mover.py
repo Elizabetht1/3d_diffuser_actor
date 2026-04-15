@@ -39,9 +39,9 @@ class Mover:
             if all(criteria) or reward == 1:
                 break
 
-            print(
-                f"Too far away (pos: {dist_pos:.3f}, rot: {dist_rot:.3f}, step: {self._step_id})... Retrying..."
-            )
+            # print(
+            #     f"Too far away (pos: {dist_pos:.3f}, rot: {dist_rot:.3f}, step: {self._step_id})... Retrying..."
+            # )
 
         # we execute the gripper action after re-tries
         action = target
