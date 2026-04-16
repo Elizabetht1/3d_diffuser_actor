@@ -83,8 +83,8 @@ class Arguments(tap.Tap):
 def save_script_snapshot(log_run):
     """Save a snapshot of eval_peract_coparticle.sh next to the output file."""
     repo_root = Path(__file__).parent.parent
-    script_path = Path(__file__).parent / "eval_peract_coparticle.sh"
-    dest = os.path.join(repo_root,'eval_logs',log_run,"eval_peract_coparticle.sh") 
+    script_path = Path(__file__).parent / "eval_peract_coparticle_v2.sh"
+    dest = os.path.join(repo_root,'eval_logs',log_run,"eval_peract_coparticle_v2.sh") 
     if script_path.exists():
         shutil.copy2(script_path, dest)
 
@@ -173,7 +173,7 @@ def main_coparticle():
     print(args)
     print("-" * 100)
     # Save results here
-    log_run = datetime.now().strftime("%m:%d:%Y.%f_%I:%M_%p")
+    log_run = datetime.now().strftime("%m:%d:%Y_%I:%M.%f_%p")
     out_root = os.path.join(Path(__file__).parent.parent,'eval_logs',log_run)
     os.makedirs(out_root,exist_ok=True)
     save_script_snapshot(log_run)
@@ -201,7 +201,7 @@ def main_coparticle():
         raise NotImplementedError()
 
 
-    model = build_model(config_path=args.config,device=args.device)
+    model = build_model(config_path=args.config, device=args.device)
     state_dict = torch.load(args.checkpoint, map_location=torch.device('cpu'))
     state_dict = {(k[len('module.'):] if k.startswith('module.') else k): v for k, v in state_dict.items()} # if accelerator
 
@@ -281,7 +281,8 @@ def main_coparticle():
         )
 
         task_success_rates[task_str] = var_success_rates
-        with open(args.output_file, "w") as f:
+        out_path = os.path.join("eval_logs",log_run,f"{task_str}_rollout.json")
+        with open(out_path, "w") as f:
             json.dump(round_floats(task_success_rates), f, indent=4)
 
 

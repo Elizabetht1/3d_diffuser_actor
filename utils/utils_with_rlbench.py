@@ -325,6 +325,11 @@ class Actioner_Coparticle:
             rec = res[0]
             action_rec = res[1]
             
+            # reshape for multiview
+            if len(self._apply_cameras) > 1:
+                assert action_rec.shape[0] == len(self._apply_cameras)
+                action_rec = action_rec[0]
+            
             
             # undo position normalization
             if self._normalizer is not None:
@@ -349,9 +354,13 @@ class Actioner_Coparticle:
             action_rec = action_rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
             trajectory = action_rec
             
-            output['trajectory'] = trajectory
+            rgb_rec = rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
             
-            output['rgb'] = rec[:, self.cond_steps:self.cond_steps + self.num_pred_steps] 
+            assert rgb_rec.shape[0] == len(self._apply_cameras)
+            assert rgb_rec.shape[1] == trajectory.shape[1]
+            
+            output['trajectory'] = trajectory
+            output['rgb'] = rgb_rec
          
         return output
 
@@ -737,7 +746,7 @@ class RLBenchEnv:
         num_history=0,
         coparticle = True,
         verify = False,
-        log_run = None
+        log_run = None,
     ):
         device = actioner.device
 
@@ -774,7 +783,7 @@ class RLBenchEnv:
                     logdir=f"eval_logs/{log_run}",
                     normalizer=actioner._normalizer
                 )
-                verifier.test_1_replay_demo()
+                # verifier.test_1_replay_demo()
                 # verifier.test_2_image_preprocessing()
                 # verifier.test_3_action_preprocessing()
                 # verifier.test_4_quant_conversion()
@@ -820,7 +829,6 @@ class RLBenchEnv:
                     pcds_input = None
                     gripper_input = [gripper]
                     
-                    
                 
                 else: 
                     rgb, pcd, gripper = self.get_rgb_pcd_gripper_from_obs(obs)
@@ -853,12 +861,12 @@ class RLBenchEnv:
                                 gripper_input, (0, 0, npad, 0), mode='replicate'
                             )
 
-                if step_id == 0:
-                    # Save initial simulation and GT frames
-                    initial_sim_frame = rgbs_input[0][0]
-                    initial_gt_frame = getattr(demo[0], f"{self.apply_cameras[0]}_rgb")
-                    Image.fromarray(initial_sim_frame).save(f'eval_logs/{log_run}/{task_str}_v{variation}_d{demo_id}_initial_sim.png')
-                    Image.fromarray(initial_gt_frame).save(f'eval_logs/{log_run}/{task_str}_v{variation}_d{demo_id}_initial_gt.png')
+                # if step_id == 0:
+                #     # Save initial simulation and GT frames
+                #     initial_sim_frame = rgbs_input[0][0]
+                #     initial_gt_frame = getattr(demo[0], f"{self.apply_cameras[0]}_rgb")
+                #     Image.fromarray(initial_sim_frame).save(f'eval_logs/{log_run}/{task_str}_v{variation}_d{demo_id}_initial_sim.png')
+                #     Image.fromarray(initial_gt_frame).save(f'eval_logs/{log_run}/{task_str}_v{variation}_d{demo_id}_initial_gt.png')
 
                 output = actioner.predict(
                     rgbs_input,
@@ -877,30 +885,35 @@ class RLBenchEnv:
                     # Execute entire predicted trajectory step by step
                     if output.get("trajectory", None) is not None:
                         
-                        trajectory = output["trajectory"][-1].cpu().numpy()
+                        trajectory = output["trajectory"][-1].squeeze().cpu().numpy()
                         trajectory[:, -1] = trajectory[:, -1].round()
                         
                         rgb_rec = output["rgb"].cpu().numpy()
-                        imagination_frames.append(rgb_rec)
+                        
 
                         # execute
-                        for action in trajectory:
-                            #try:
-                            #    collision_checking = self._collision_checking(task_str, step_id)
-                            #    obs, reward, terminate, _ = move(action_np, collision_checking=collision_checking)
-                            #except:
-                            #    terminate = True
-                            #    pass
+                        for idx,action in enumerate(trajectory):
                             collision_checking = self._collision_checking(task_str, step_id)
                             obs, reward, terminate, _ = move(action, collision_checking=collision_checking)
                             
-                            actions_history.append(action)
-                            
+
                             state_dict, gripper = self.get_obs_action(obs)
+                            actions_history.append(action)
                             frames_cam0.append(state_dict['rgb'][0])
+                            imagination_frames.append(rgb_rec[:,idx,...])
+                            
+                            
+                            
                             if use_second_cam:
                                 frames_cam1.append(state_dict['rgb'][1])
 
+                            if not len(actions_history) == len(frames_cam0):
+                                breakpoint()
+                                
+                            assert len(actions_history) == len(frames_cam0)
+                            assert len(imagination_frames) == len(actions_history)
+                        
+                        
 
                     # Or plan to reach next predicted keypoint
                     else:
@@ -970,17 +983,20 @@ class RLBenchEnv:
             
             gt_cam0 = gt_cam0[:T] / 255.0
             
-            imagination_frames = np.concatenate(imagination_frames,axis=1)[:,:T]
-            imagination_cam0 = imagination_frames[0].transpose(0,2,3,1)
+            imagination_frames = np.stack(imagination_frames, axis=1)  # (num_cams, T, 3, H, W)
+            assert imagination_frames.shape[1] == len(actions_history)
+            imagination_frames = imagination_frames[:,:T]
+            imagination_cam0 = imagination_frames[0].transpose(0,2,3,1)[:T]
+            
             
             if use_second_cam:
                 frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
                 gt_cam1 = gt_cam1[:T] / 255.0
-                imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)
+                imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)[:T]
             else: 
                 frames_cam1 = gt_cam1 = imagination_cam1 = None
             
-            
+
             animate_trajectories(
                 orig_trajectory=gt_cam0,
                 pred_trajectory=frames_cam0,

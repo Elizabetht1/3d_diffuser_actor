@@ -11,6 +11,8 @@ from tqdm import tqdm
 
 from utils.mover import Mover
 from lpwm_dev.utils.util_func import create_segmentation_map
+import os
+import json
 
 
 from pyrep.errors import ConfigurationPathError, IKError
@@ -187,9 +189,31 @@ class Verify2:
         self.loc_norm = location_normalization
         
         self._normalizer = normalizer
+        
+        self.stats = self._load_run_stats()
+        
 
     # ----------------------------------------------------------- helpers
+    def _load_run_stats(self):
+        """ read the stats json file that exists for this log run, or create if it doesn't exist """
+        stats_path = os.path.join(self.logdir, 'verifier_stats.json')
+        if os.path.exists(stats_path):
+            with open(stats_path, 'r') as f:
+                return json.load(f)
+        stats = {}
+        with open(stats_path, 'w') as f:
+            json.dump(stats, f)
+        return stats
 
+    def _update_stats(self, test, result):
+        """ append result to value (list of results) associated with key 'test' """
+        key = str(test)
+        self.stats.setdefault(key, []).append(result)
+        stats_path = os.path.join(self.logdir, 'verifier_stats.json')
+        with open(stats_path, 'w') as f:
+            json.dump(self.stats, f, indent=2)
+
+        
     def _build_image_transform(self, image_size: int):
         import torchvision.transforms as transforms
         return transforms.Compose([
@@ -228,10 +252,12 @@ class Verify2:
         for obs in demo:
             gt_actions.append(np.concatenate([obs.gripper_pose, [obs.gripper_open]]))
             frames_0.append(getattr(obs, f"{camera_names[0]}_rgb"))
-            if len(camera_names) >= 2:
+            if len(camera_names) > 1:
                 frames_1.append(getattr(obs, f"{camera_names[1]}_rgb"))
+                
         cam1 = np.stack(frames_1) / 255.0 if frames_1 else None
         cam0 = np.stack(frames_0) / 255.0
+        assert cam1.shape == cam0.shape
         return np.stack(gt_actions), cam0, cam1
 
     # ------------------------------------------------------------------ tests
@@ -381,7 +407,8 @@ class Verify2:
         frames_cam1 : List[np.ndarray] = []
         imagination_frames = []
         
-        trajectory = output["trajectory"][-1].cpu().numpy()
+
+        trajectory = output["trajectory"][-1].squeeze().cpu().numpy()
         trajectory[:, -1] = trajectory[:, -1].round()
         rgb_rec = output["rgb"].cpu().numpy()
         imagination_frames.append(rgb_rec)
@@ -398,6 +425,7 @@ class Verify2:
         use_second_cam = len(self.env.apply_cameras) > 1
        
         
+       
         for action in tqdm(trajectory):
             collision_checking = self.env._collision_checking(self.task_str, step_id)
             try:
@@ -436,11 +464,13 @@ class Verify2:
         imagination_cam0 = imagination_frames[0].transpose(0,2,3,1)
         max_ts = min(frames_cam0.shape[0],self.gt_frames_cam0.shape[0],imagination_cam0.shape[0])
         
+        
         if use_second_cam:
             imagination_cam1 = imagination_frames[1].transpose(0,2,3,1)[:max_ts] 
             frames_cam1 = frames_cam1[:max_ts]
-            self.gt_frames_cam1 = self.gt_frames_cam1[:max_ts]
+            gt_frames_cam1 = self.gt_frames_cam1[:max_ts]
         else: 
+            gt_frames_cam1 = None
             imagination_cam1 = None
         
         
@@ -456,7 +486,7 @@ class Verify2:
             t1="-Sim-Rollout",
             t2="-Imagination",
             title=f"GT vs Predicted - {self.actioner._desc}",
-            orig_trajectory2=self.gt_frames_cam1,
+            orig_trajectory2=gt_frames_cam1,
             pred_trajectory_12=frames_cam1,
             pred_trajectory_22= imagination_cam1
         )
@@ -465,6 +495,7 @@ class Verify2:
     
 
         passed = max_reward == 1.0
+        self._update_stats(5,passed) # 0 /1
         print(f"[test_5] {'PASS' if passed else 'FAIL'}: "
               f"open-loop max_reward={max_reward:.2f} over {T} steps")
         return passed
@@ -547,9 +578,10 @@ class Verify2:
         
     
         frames_cam0 = np.stack(frames_cam0)[:T] / 255.0
+        gt_frames_cam1 = None
         if use_second_cam:
             frames_cam1 = np.stack(frames_cam1)[:T] / 255.0
-            self.gt_frames_cam1 = self.gt_frames_cam1[:T]
+            gt_frames_cam1 = self.gt_frames_cam1[:T]
             
 
         plot_actions(
@@ -576,6 +608,7 @@ class Verify2:
 
 
         passed = reward == 1.0
+        self._update_stats(6,passed)
         print(f"[test_6] {'PASS' if passed else 'FAIL'}: max_reward={reward:.2f}")
         return passed
 
@@ -668,6 +701,10 @@ class Verify2:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
            
         recon_actions = recon_actions.squeeze().cpu().numpy()
+        if len(self.cameras) > 1:
+            assert recon_actions.shape[0] == len(self.cameras)
+            recon_actions = recon_actions[0]
+            
         del parsed_gt_frames  # free large GPU frame tensor before simulation
         torch.cuda.empty_cache()
 
@@ -711,10 +748,11 @@ class Verify2:
         
         max_ts = min(frames_cam0.shape[0],self.gt_frames_cam0.shape[0],imagination_cam0.shape[0])
           
+        gt_frames_cam1 = None
         if use_second_camera:
             imagination_cam1 = imagination_frames[1].permute(0,2,3,1).detach().cpu().numpy()[:max_ts] 
             frames_cam1 = frames_cam1[:max_ts]
-            self.gt_frames_cam1 = self.gt_frames_cam1[:max_ts] 
+            gt_frames_cam1 = self.gt_frames_cam1[:max_ts] 
         
     
       
@@ -730,12 +768,13 @@ class Verify2:
             t1="-Sim-Rollout",
             t2="-Imagination",
             title=f"GT vs Predicted - {self.actioner._desc}",
-            orig_trajectory2=self.gt_frames_cam1,
+            orig_trajectory2=gt_frames_cam1,
             pred_trajectory_12=frames_cam1,
             pred_trajectory_22= imagination_cam1
         )
 
         passed = reward == 1.0
+        self._update_stats(7,passed)
         print(f"[test_7] {'PASS' if passed else 'FAIL'}: max_reward={reward:.2f}")
         return passed
 
