@@ -257,7 +257,8 @@ class Verify2:
                 
         cam1 = np.stack(frames_1) / 255.0 if frames_1 else None
         cam0 = np.stack(frames_0) / 255.0
-        assert cam1.shape == cam0.shape
+        if len(camera_names) > 1:
+            assert cam1.shape == cam0.shape
         return np.stack(gt_actions), cam0, cam1
 
     # ------------------------------------------------------------------ tests
