@@ -201,7 +201,7 @@ def main_coparticle(args=None):
         raise NotImplementedError()
 
 
-    model = build_model(config_path=args.config, device=args.device)
+    model = build_model(config_path=args.config, device_override=args.device)
     state_dict = torch.load(args.checkpoint, map_location=torch.device('cpu'))
     state_dict = {(k[len('module.'):] if k.startswith('module.') else k): v for k, v in state_dict.items()} # if accelerator
 
