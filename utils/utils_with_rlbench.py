@@ -680,9 +680,10 @@ class RLBenchEnv:
 
         var_success_rates = {}
         var_num_valid_demos = {}
+        verifier_success_rates = {}
         for variation in task_variations:
             task.set_variation(variation)
-            success_rate, valid, num_valid_demos = (
+            success_rate, valid, num_valid_demos, verifier_success_rates = (
                 self._evaluate_task_on_one_variation(
                     task_str=task_str,
                     task=task,
@@ -709,6 +710,8 @@ class RLBenchEnv:
             sum(var_success_rates.values()) /
             sum(var_num_valid_demos.values())
         )
+        
+        var_success_rates['verification'] = verifier_success_rates
 
         return var_success_rates
     
@@ -769,6 +772,7 @@ class RLBenchEnv:
                 continue
             
             # verify 
+            verifier_success_rates = {}
             if verify: 
                 verifier = Verify2(
                     actioner=actioner,
@@ -790,6 +794,8 @@ class RLBenchEnv:
                 verifier.test_5_replay_open_loop(variation=variation,demo_id=demo_id) # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
                 verifier.test_6_replay_recon(variation=variation,demo_id=demo_id)
                 verifier.test_7_replay_recon_with_ctx(variation=variation,demo_id=demo_id)
+                
+                verifier_success_rates = verifier._load_run_stats()
                 del verifier
                 torch.cuda.empty_cache()
             else:
@@ -1019,7 +1025,7 @@ class RLBenchEnv:
         else:
             valid = True
 
-        return success_rate, valid, num_valid_demos
+        return success_rate, valid, num_valid_demos, verifier_success_rates
 
     def _collision_checking(self, task_str, step_id):
         """Collision checking for planner."""

@@ -163,11 +163,11 @@ def load_models(args):
     return model
 
 
-def main_coparticle():
-    
+def main_coparticle(args=None):
+    if args is None:
+        args = Arguments().parse_args()
 
     # Arguments
-    args = Arguments().parse_args()
     args.cameras = tuple(x for y in args.cameras for x in y.split(","))
     print("Arguments:")
     print(args)
@@ -284,6 +284,8 @@ def main_coparticle():
         out_path = os.path.join("eval_logs",log_run,f"{task_str}_rollout.json")
         with open(out_path, "w") as f:
             json.dump(round_floats(task_success_rates), f, indent=4)
+        
+        return task_success_rates, out_root
 
 
 def main_3ddfa():
