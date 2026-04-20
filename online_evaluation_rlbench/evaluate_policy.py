@@ -196,9 +196,9 @@ def main_coparticle(args=None):
     
     
 
-    instruction = load_instructions(args.instructions)
-    if instruction is None:
-        raise NotImplementedError()
+    # instruction = load_instructions(args.instructions)
+    # if instruction is None:
+    #     raise NotImplementedError()
 
 
     model = build_model(config_path=args.config, device_override=args.device)
@@ -240,7 +240,7 @@ def main_coparticle(args=None):
         max_length=config['language_max_len'],
         normalizer=normalizer,
         gripper_loc_bounds=gripper_loc_bounds,
-        instructions=instruction,
+        # instructions=instruction,
         embed_type=args.embed_type
     )
     

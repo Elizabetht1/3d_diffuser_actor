@@ -787,11 +787,11 @@ class RLBenchEnv:
                     logdir=f"eval_logs/{log_run}",
                     normalizer=actioner._normalizer
                 )
-                # verifier.test_1_replay_demo()
+                verifier.test_1_replay_demo()
                 # verifier.test_2_image_preprocessing()
                 # verifier.test_3_action_preprocessing()
                 # verifier.test_4_quant_conversion()
-                # verifier.test_5_replay_open_loop(variation=variation,demo_id=demo_id) # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
+                verifier.test_5_replay_open_loop(variation=variation,demo_id=demo_id) # @TODO some sort of memory leakage – gets an OOM error after a couple of iterations 
                 verifier.test_6_replay_recon(variation=variation,demo_id=demo_id)
                 verifier.test_7_replay_recon_with_ctx(variation=variation,demo_id=demo_id)
                 

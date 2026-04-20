@@ -519,9 +519,9 @@ class Verify2:
         elif self.loc_norm:
             parsed_gt_actions[...,:3] = normalize_pos(pos= parsed_gt_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
         else:
-            ValueError("[WARNING] no normalization applied")
+            raise ValueError("[WARNING] no normalization applied")
             
-        if parsed_gt_actions.min() < -1 - 1e-6 or parsed_gt_actions.max() > 1 + 1e6:
+        if parsed_gt_actions.min() < -1 - 1e-6 or parsed_gt_actions.max() > 1 + 1e-6:
             print("[WARNING] actions are NOT normalized.\n")
         # parsed_gt_actions = parsed_gt_actions.unsqueeze(1)
         recon_actions = eval_action_recon2(self.model, parsed_gt_actions, 
@@ -536,7 +536,7 @@ class Verify2:
         elif self.loc_norm:
             recon_actions[...,:3] = unnormalize_pos(pos= recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
         else:
-            ValueError("[WARNING] no normalization applied")
+            raise ValueError("[WARNING] no normalization applied")
             
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
@@ -632,7 +632,7 @@ class Verify2:
         elif self.loc_norm:
             parsed_gt_actions[...,:3] = normalize_pos(pos= parsed_gt_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
         else:
-            ValueError("[WARNING] no normalization applied")
+            raise ValueError("[WARNING] no normalization applied")
             
         parsed_gt_actions = parsed_gt_actions.unsqueeze(0)
 
@@ -696,7 +696,7 @@ class Verify2:
         elif self.loc_norm:
             recon_actions[...,:3] = unnormalize_pos(pos= recon_actions[...,:3],gripper_loc_bounds=self.actioner.gripper_loc_bounds)
         else:
-            ValueError("[WARNING] no normalization applied")
+            raise ValueError("[WARNING] no normalization applied")
             
         if self.convert_6D:
             recon_actions = action_ortho6d_to_xyzw(recon_actions)
