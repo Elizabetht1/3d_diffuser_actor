@@ -285,7 +285,7 @@ def main_coparticle(args=None):
         with open(out_path, "w") as f:
             json.dump(round_floats(task_success_rates), f, indent=4)
         
-        return task_success_rates, out_root
+    return task_success_rates, out_root
 
 
 def main_3ddfa():
