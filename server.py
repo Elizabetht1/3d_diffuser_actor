@@ -90,34 +90,43 @@ def run_experiment(experiment_id):
 
 
 def _run_eval(caller_ip: str, config_root: str, experiment_id: str, callback_url: str, epoch : int):
-    path = os.path.join("test_weights", experiment_id)
-    os.makedirs(path, exist_ok=True)
+    try:
+        path = os.path.join("test_weights", experiment_id)
+        os.makedirs(path, exist_ok=True)
 
-    pem = os.path.expanduser("~/.ssh/lambda_keys/tallambda.pem")
-    src = f"ubuntu@{caller_ip}"
+        pem = os.path.expanduser("~/.ssh/lambda_keys/tallambda.pem")
+        src = f"ubuntu@{caller_ip}"
 
-    subprocess.run(["scp", "-i", pem, f"{src}:{config_root}/hparams.json", path], check=True)
-    subprocess.run(["scp", "-i", pem, f"{src}:{config_root}/saves/rlbench_gddlp{experiment_id}.pth", path], check=True)
+        _scp = ["scp", "-i", pem, "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"]
+        subprocess.run([*_scp, f"{src}:{config_root}/hparams.json", path], check=True, timeout=120)
+        subprocess.run([*_scp, f"{src}:{config_root}/saves/rlbench_gddlp{experiment_id}.pth", path], check=True, timeout=600)
 
-    for fname in os.listdir(path):
-        if not fname.endswith(".pth"):
-            continue
-        dest = "best.pth" if fname.endswith("best.pth") else "recent.pth"
-        os.rename(os.path.join(path, fname), os.path.join(path, dest))
+        for fname in os.listdir(path):
+            if not fname.endswith(".pth"):
+                continue
+            dest = "best.pth" if fname.endswith("best.pth") else "recent.pth"
+            os.rename(os.path.join(path, fname), os.path.join(path, dest))
 
-    sim_results,sim_results_loc = run_experiment(experiment_id)
-     
+        
+        result = run_experiment(experiment_id)
+        if result is None:
+            logging.error(f"run_experiment returned None for {experiment_id}; skipping callback")
+            return
+        sim_results, sim_results_loc = result
+        
 
 
-    results = {
-            'results': sim_results, 
-            'epoch': epoch,
-            'loc': config_root,
-            'sim_results_loc': sim_results_loc
-            }
+        results = {
+                'results': sim_results, 
+                'epoch': epoch,
+                'loc': config_root,
+                'sim_results_loc': sim_results_loc
+                }
 
-    logging.info(f"posting results to {callback_url} ")
-    requests.post(callback_url, json=results)
+        logging.info(f"posting results to {callback_url} ")
+        requests.post(callback_url, json=results)
+    except Exception as e:
+        logging.error(f"Error encountered: {e}")
 
 
 request_queue: queue.Queue = queue.Queue()
@@ -128,7 +137,7 @@ def _queue_worker():
     while True:
         caller_ip, config_root, experiment_id, callback_url, epoch = request_queue.get()
         logger.info(f"Starting {experiment_id} ({request_queue.qsize()} queued)")
-        proc = multiprocessing.Process(
+        proc = multiprocessing.get_context('spawn').Process(
             target=_run_eval,
             args=(caller_ip, config_root, experiment_id, callback_url, epoch),
             daemon=True,
@@ -139,8 +148,9 @@ def _queue_worker():
         request_queue.task_done()
 
 
-_worker_thread = threading.Thread(target=_queue_worker, daemon=True)
-_worker_thread.start()
+if multiprocessing.current_process().name == 'MainProcess':
+    _worker_thread = threading.Thread(target=_queue_worker, daemon=True)
+    _worker_thread.start()
 
 
 @app.post("/evaluate")
