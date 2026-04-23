@@ -1,4 +1,5 @@
 import os
+import itertools
 import threading
 import queue
 import multiprocessing
@@ -20,7 +21,8 @@ app = FastAPI()
 
 # --- SERVER (machine B) ---
 
-device = 'cuda:0'
+_DEVICES = ['cuda:0', 'cuda:1']
+_WORKERS_PER_GPU = 3
 data_dir='/data/rlbench2/val'
 num_episodes=10
 gripper_loc_bounds_file="tasks/18_peract_tasks_location_bounds_corrected.json"
@@ -34,7 +36,7 @@ headless=1
 image_size=(128,128)
 variations=tuple(range(60))
 
-def run_experiment(experiment_id):
+def run_experiment(experiment_id, device):
 
     weight_dir = os.path.join('test_weights', experiment_id, 'recent.pth')
     config_fp = os.path.join('test_weights', experiment_id, 'hparams.json')
@@ -89,7 +91,7 @@ def run_experiment(experiment_id):
 
 
 
-def _run_eval(caller_ip: str, config_root: str, experiment_id: str, callback_url: str, epoch : int):
+def _run_eval(caller_ip: str, config_root: str, experiment_id: str, callback_url: str, epoch: int, device: str):
     try:
         path = os.path.join("test_weights", experiment_id)
         os.makedirs(path, exist_ok=True)
@@ -108,7 +110,7 @@ def _run_eval(caller_ip: str, config_root: str, experiment_id: str, callback_url
             os.rename(os.path.join(path, fname), os.path.join(path, dest))
 
         
-        result = run_experiment(experiment_id)
+        result = run_experiment(experiment_id, device)
         if result is None:
             logging.error(f"run_experiment returned None for {experiment_id}; skipping callback")
             return
@@ -129,34 +131,37 @@ def _run_eval(caller_ip: str, config_root: str, experiment_id: str, callback_url
         logging.error(f"Error encountered: {e}")
 
 
-request_queue: queue.Queue = queue.Queue()
+_gpu_queues = [queue.Queue(), queue.Queue()]
+_job_counter = itertools.count()
 
 
-def _queue_worker():
-    logger.info("Queue worker started")
+def _gpu_worker(gpu_queue: queue.Queue, device: str):
+    logger.info(f"GPU worker started for {device}")
     while True:
-        caller_ip, config_root, experiment_id, callback_url, epoch = request_queue.get()
-        logger.info(f"Starting {experiment_id} ({request_queue.qsize()} queued)")
+        caller_ip, config_root, experiment_id, callback_url, epoch = gpu_queue.get()
+        logger.info(f"Starting {experiment_id} on {device} ({gpu_queue.qsize()} queued on {device})")
         proc = multiprocessing.get_context('spawn').Process(
             target=_run_eval,
-            args=(caller_ip, config_root, experiment_id, callback_url, epoch),
+            args=(caller_ip, config_root, experiment_id, callback_url, epoch, device),
             daemon=True,
         )
         proc.start()
         proc.join()
-        logger.info(f"Finished {experiment_id}")
-        request_queue.task_done()
+        logger.info(f"Finished {experiment_id} on {device}")
+        gpu_queue.task_done()
 
 
 if multiprocessing.current_process().name == 'MainProcess':
-    _worker_thread = threading.Thread(target=_queue_worker, daemon=True)
-    _worker_thread.start()
+    for _q, _dev in zip(_gpu_queues, _DEVICES):
+        for _ in range(_WORKERS_PER_GPU):
+            threading.Thread(target=_gpu_worker, args=(_q, _dev), daemon=True).start()
 
 
 @app.post("/evaluate")
 def evaluate(body: dict, request: Request):
-    request_queue.put((request.client.host, body["config_root"], body["experiment_id"], body["callback_url"], body['epoch']))
-    return {"status": "ack", "queue_position": request_queue.qsize()}
+    gpu_idx = next(_job_counter) % 2
+    _gpu_queues[gpu_idx].put((request.client.host, body["config_root"], body["experiment_id"], body["callback_url"], body['epoch']))
+    return {"status": "ack", "gpu": _DEVICES[gpu_idx], "queue_depth": _gpu_queues[gpu_idx].qsize()}
 
 
 
