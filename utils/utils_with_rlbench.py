@@ -25,6 +25,8 @@ from rlbench.demo import Demo
 from pyrep.errors import IKError, ConfigurationPathError
 from pyrep.const import RenderMode
 
+import logging 
+log = logging.getLogger(__name__)
 
 # NEW COPARTICLE UTILS
 from lpwm_dev.rlbench_utils.geometry import (
@@ -102,8 +104,11 @@ class Actioner_Coparticle:
         max_length = 12,
         gripper_loc_bounds = None,
         normalizer = None,
-        embed_type = 't5'
+        embed_type = 't5',
+        use_lang_mask = False,
+        model_max_length = 53
     ):
+        
         self._policy = policy
         self._instructions = instructions
         self._apply_cameras = apply_cameras
@@ -128,7 +133,7 @@ class Actioner_Coparticle:
             self._encoder = T5EncoderModel.from_pretrained('t5-large')
             self._encoder.eval()
         else: 
-            self._tokenizer, self._encoder, device = load_preprocessing_models(embed_type,device=self.device)
+            self._tokenizer, self._encoder, device = load_preprocessing_models(embed_type,model_max_length=model_max_length)
         
 
         self._policy.eval()
@@ -148,17 +153,37 @@ class Actioner_Coparticle:
         
         if normalizer is not None:
             self._normalizer = normalizer
+            
+        # If we use language masking , include here
+        self.use_lang_mask = use_lang_mask
+        self._instr_mask = None
       
     
     def _embed_clip(self, descriptions):
         desc = descriptions[np.random.randint(len(descriptions))]
         tokens = self._tokenizer(desc, padding="max_length")["input_ids"]
-        tokens = torch.tensor(tokens).unsqueeze(0).to(self.device)
+        encoder_device = next(self._encoder.parameters()).device
+        tokens = torch.tensor(tokens).unsqueeze(0).to(encoder_device)
         with torch.no_grad():
-            pred = self._encoder(tokens).last_hidden_state.squeeze(0).float()
+            embed = self._encoder(tokens).last_hidden_state.squeeze(0).float()
+            
+        lang_mask = None
+        if self.use_lang_mask:
 
+            L = embed.shape[0]
+
+            # CLIP uses EOS token (49407) as both sentence-end and padding.
+            # The first occurrence of 49407 is the real EOS; positions after it are padding.
+            eos_id = 49407
+            eos_pos = (tokens == eos_id).nonzero(as_tuple=True)[1]
+            n_valid = int(eos_pos[0].item()) + 1 if len(eos_pos) > 0 else L
+            lang_mask = torch.zeros(L, dtype=torch.bool)
+            lang_mask[:n_valid] = True
+            lang_mask = lang_mask.unsqueeze(0).to(self.device)
+
+        embed = embed.unsqueeze(0)
         
-        return pred, desc
+        return embed.to(self.device), desc, lang_mask
             
     def _embed_t5(self, descriptions):
         desc = descriptions[np.random.randint(len(descriptions))]
@@ -166,9 +191,11 @@ class Actioner_Coparticle:
             desc, max_length=self._max_length,
             padding='max_length', truncation=True, return_tensors='pt',
         )
+        if self.use_lang_mask:
+            raise ValueError("Language masking not implemented for T5")
         tokenized_desc = tokenized_desc['input_ids']
         with torch.no_grad():
-            return self._encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device), desc
+            return self._encoder(tokenized_desc).last_hidden_state.squeeze(0).float().to(self.device), desc, None
     
     def _embed(self,descriptions):
         
@@ -182,7 +209,7 @@ class Actioner_Coparticle:
     def load_episode(self, task_str, variation, descriptions):
         self._task_str = task_str
 
-        self._instr, desc = self._embed(descriptions)
+        self._instr, desc, self._instr_mask = self._embed(descriptions)
 
         self._task_id = torch.tensor(TASK_TO_ID[task_str]).unsqueeze(0)
         self._actions = {}
@@ -320,7 +347,8 @@ class Actioner_Coparticle:
                 n_pred_eq_gt=False,
                 return_aux_rec=True,
                 actions=actions,
-                lang_embed=self._instr
+                lang_embed=self._instr,
+                lang_mask=self._instr_mask
             )
             rec = res[0]
             action_rec = res[1]
@@ -756,6 +784,7 @@ class RLBenchEnv:
         success_rate = 0
         num_valid_demos = 0
         total_reward = 0
+        verifier_success_rates = {}
 
         log_run = log_run if log_run is not None else datetime.now().strftime("%m:%d:%Y_%I:%M_%p") # directory to store logs at 
         os.makedirs(f"eval_logs/{log_run}",exist_ok=True)

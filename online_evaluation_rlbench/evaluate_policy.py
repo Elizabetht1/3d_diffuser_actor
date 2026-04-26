@@ -201,6 +201,7 @@ def main_coparticle(args=None):
     #     raise NotImplementedError()
 
 
+    
     model = build_model(config_path=args.config, device_override=args.device)
     state_dict = torch.load(args.checkpoint, map_location=torch.device('cpu'))
     state_dict = {(k[len('module.'):] if k.startswith('module.') else k): v for k, v in state_dict.items()} # if accelerator
@@ -241,7 +242,9 @@ def main_coparticle(args=None):
         normalizer=normalizer,
         gripper_loc_bounds=gripper_loc_bounds,
         # instructions=instruction,
-        embed_type=args.embed_type
+        embed_type=args.embed_type,
+        use_lang_mask = config.get('use_lang_mask',False),
+        model_max_length = config.get('language_max_len',53)
     )
     
     max_eps_dict = load_episodes()["max_episode_length"]
