@@ -291,7 +291,7 @@ def main_coparticle(args=None):
     return task_success_rates, out_root
 
 
-def evaluate_single_variation(args, task_str: str, variation: int, n_demos: int, device: str, result_queue):
+def evaluate_single_variation(args, task_str: str, variation: int, episode_idx: int, n_trials: int, device: str, result_queue):
     """Evaluate one (task, variation) pair. Runs in a spawned subprocess."""
     args.device = device
     os.environ['DISPLAY'] = ':1'
@@ -353,8 +353,9 @@ def evaluate_single_variation(args, task_str: str, variation: int, n_demos: int,
     success_rate, valid, num_valid_demos = env.evaluate_one_variation(
         task_str=task_str,
         variation=variation,
+        episode_idx=episode_idx,
         max_steps=max_steps,
-        num_demos=n_demos,
+        num_demos=n_trials,
         actioner=actioner,
         max_tries=args.max_tries,
         dense_interpolation=bool(args.dense_interpolation),

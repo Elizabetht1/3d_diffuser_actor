@@ -1,5 +1,6 @@
 import os
 import glob
+import random
 import itertools
 import threading
 import queue
@@ -26,7 +27,8 @@ app = FastAPI()
 _DEVICES = ['cuda:0', 'cuda:1']
 _WORKERS_PER_GPU = 3
 data_dir = '/data/rlbench2/val'
-trials_per_variation = 5
+episodes_per_variation = 2   # number of randomly sampled episodes per variation
+trials_per_episode = 2       # number of repeated trials on each sampled episode
 gripper_loc_bounds_file = "tasks/18_peract_tasks_location_bounds_corrected.json"
 use_instruction = 1
 max_tries = 2
@@ -49,26 +51,29 @@ class ExperimentContext:
     epoch: int
     config_root: str
     total: int
-    results: dict = field(default_factory=dict)   # {(task, variation): {'success_rate', 'num_valid_demos'} | None}
+    results: dict = field(default_factory=dict)   # {(task, variation, episode_idx): {'success_rate', 'num_valid_demos'} | None}
     completed: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def record(self, task: str, variation: int, result) -> bool:
-        """Record one (task, variation) result. Returns True when all items are done."""
+    def record(self, task: str, variation: int, episode_idx: int, result) -> bool:
+        """Record one result. Returns True when all items are done."""
         with self.lock:
-            self.results[(task, variation)] = result
+            self.results[(task, variation, episode_idx)] = result
             self.completed += 1
             return self.completed == self.total
 
 
 def _aggregate_and_post(ctx: ExperimentContext):
+    # Accumulate success counts and valid demo counts per (task, variation) across episodes
     task_success: dict = {}
     task_valid_demos: dict = {}
-    for (task, var), result in ctx.results.items():
+    for (task, var, _ep), result in ctx.results.items():
         if result is None:
             continue
-        task_success.setdefault(task, {})[var] = result['success_rate']
-        task_valid_demos.setdefault(task, {})[var] = result['num_valid_demos']
+        task_success.setdefault(task, {}).setdefault(var, 0)
+        task_valid_demos.setdefault(task, {}).setdefault(var, 0)
+        task_success[task][var] += result['success_rate']
+        task_valid_demos[task][var] += result['num_valid_demos']
 
     aggregated = {}
     for task in task_success:
@@ -95,6 +100,11 @@ def discover_variations(task: str) -> list:
     return sorted(int(d.split("variation")[-1]) for d in dirs)
 
 
+def discover_episodes(task: str, variation: int) -> list:
+    dirs = glob.glob(os.path.join(data_dir, task, f"variation{variation}", "episodes", "episode*"))
+    return sorted(int(os.path.basename(d).replace("episode", "")) for d in dirs if os.path.isdir(d))
+
+
 
 # ---------------------------------------------------------------------------
 # Args builder (runs in setup worker, once per experiment)
@@ -118,7 +128,7 @@ def _build_args(experiment_id: str) -> Arguments:
     args.checkpoint = weight_dir
     args.config = config_fp
     args.data_dir = data_dir
-    args.num_episodes = trials_per_variation
+    args.num_episodes = trials_per_episode
     args.gripper_loc_bounds_file = gripper_loc_bounds_file
     args.use_instruction = use_instruction
     args.max_tries = max_tries
@@ -179,10 +189,16 @@ def _setup_worker():
                     logger.warning(f"No variations found for task {task} in {data_dir}")
                     continue
                 for var in variations:
-                    items.append((task, var, trials_per_variation))
+                    episodes = discover_episodes(task, var)
+                    if not episodes:
+                        logger.warning(f"No episodes found for {task} var={var}; skipping")
+                        continue
+                    sampled = random.sample(episodes, min(episodes_per_variation, len(episodes)))
+                    for ep_idx in sampled:
+                        items.append((task, var, ep_idx))
 
             if not items:
-                logger.error(f"No (task, variation) items found for {experiment_id}; skipping")
+                logger.error(f"No items found for {experiment_id}; skipping")
                 _setup_queue.task_done()
                 continue
 
@@ -193,9 +209,9 @@ def _setup_worker():
                 config_root=config_root,
                 total=len(items),
             )
-            for task, var, n_demos in items:
+            for task, var, ep_idx in items:
                 gpu_idx = next(_job_counter) % 2
-                _gpu_queues[gpu_idx].put((args, task, var, n_demos, ctx))
+                _gpu_queues[gpu_idx].put((args, task, var, ep_idx, trials_per_episode, ctx))
 
             logger.info(f"Enqueued {len(items)} items for {experiment_id}")
         except Exception as e:
@@ -211,24 +227,24 @@ def _setup_worker():
 def _gpu_worker(gpu_queue: queue.Queue, device: str):
     logger.info(f"GPU worker started for {device}")
     while True:
-        args, task, var, n_demos, ctx = gpu_queue.get()
-        logger.info(f"Starting {ctx.experiment_id} | {task} var={var} on {device} ({gpu_queue.qsize()} queued)")
+        args, task, var, ep_idx, n_trials, ctx = gpu_queue.get()
+        logger.info(f"Starting {ctx.experiment_id} | {task} var={var} ep={ep_idx} on {device} ({gpu_queue.qsize()} queued)")
         try:
             result_q = multiprocessing.Queue()
             proc = multiprocessing.get_context('spawn').Process(
                 target=evaluate_single_variation,
-                args=(args, task, var, n_demos, device, result_q),
+                args=(args, task, var, ep_idx, n_trials, device, result_q),
                 daemon=True,
             )
             proc.start()
             proc.join()
             result = result_q.get() if not result_q.empty() else None
         except Exception as e:
-            logger.error(f"Worker error for {ctx.experiment_id} | {task} var={var}: {e}")
+            logger.error(f"Worker error for {ctx.experiment_id} | {task} var={var} ep={ep_idx}: {e}")
             result = None
 
-        all_done = ctx.record(task, var, result)
-        logger.info(f"Finished {ctx.experiment_id} | {task} var={var} on {device} (done={ctx.completed}/{ctx.total})")
+        all_done = ctx.record(task, var, ep_idx, result)
+        logger.info(f"Finished {ctx.experiment_id} | {task} var={var} ep={ep_idx} on {device} (done={ctx.completed}/{ctx.total})")
 
         if all_done:
             try:

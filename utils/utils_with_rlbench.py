@@ -747,6 +747,7 @@ class RLBenchEnv:
         self,
         task_str: str,
         variation: int,
+        episode_idx: int,
         max_steps: int,
         num_demos: int,
         actioner,
@@ -758,7 +759,7 @@ class RLBenchEnv:
         verify: bool = False,
         log_run=None,
     ):
-        """Run evaluation for a single (task, variation) pair."""
+        """Repeat episode_idx num_demos times for a single (task, variation, episode) triple."""
         self.env.launch()
         try:
             task_type = task_file_to_task_class(task_str)
@@ -778,6 +779,7 @@ class RLBenchEnv:
                 num_history=num_history,
                 verify=verify,
                 log_run=log_run,
+                fixed_episode_index=episode_idx,
             )
         finally:
             self.env.shutdown()
@@ -818,6 +820,7 @@ class RLBenchEnv:
         coparticle = True,
         verify = False,
         log_run = None,
+        fixed_episode_index: Optional[int] = None,
     ):
         device = actioner.device
 
@@ -826,16 +829,17 @@ class RLBenchEnv:
         total_reward = 0
         verifier_success_rates = {}
 
-        log_run = log_run if log_run is not None else datetime.now().strftime("%m:%d:%Y_%I:%M_%p") # directory to store logs at 
+        log_run = log_run if log_run is not None else datetime.now().strftime("%m:%d:%Y_%I:%M_%p") # directory to store logs at
         os.makedirs(f"eval_logs/{log_run}",exist_ok=True)
-        
+
         for demo_id in range(num_demos):
             if verbose:
                 print()
                 print(f"Starting demo {demo_id}")
 
+            episode_index = fixed_episode_index if fixed_episode_index is not None else demo_id
             try:
-                demo = self.get_demo(task_str, variation, episode_index=demo_id)[0]
+                demo = self.get_demo(task_str, variation, episode_index=episode_index)[0]
                 num_valid_demos += 1
             except:
                 continue
