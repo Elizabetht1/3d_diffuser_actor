@@ -26,7 +26,7 @@ app = FastAPI()
 _DEVICES = ['cuda:0', 'cuda:1']
 _WORKERS_PER_GPU = 3
 data_dir = '/data/rlbench2/val'
-num_episodes = 10
+trials_per_variation = 5
 gripper_loc_bounds_file = "tasks/18_peract_tasks_location_bounds_corrected.json"
 use_instruction = 1
 max_tries = 2
@@ -95,11 +95,6 @@ def discover_variations(task: str) -> list:
     return sorted(int(d.split("variation")[-1]) for d in dirs)
 
 
-def distribute_episodes(n_episodes: int, variations: list) -> dict:
-    n = len(variations)
-    base, extra = divmod(n_episodes, n)
-    return {var: base + (1 if i < extra else 0) for i, var in enumerate(variations)}
-
 
 # ---------------------------------------------------------------------------
 # Args builder (runs in setup worker, once per experiment)
@@ -123,7 +118,7 @@ def _build_args(experiment_id: str) -> Arguments:
     args.checkpoint = weight_dir
     args.config = config_fp
     args.data_dir = data_dir
-    args.num_episodes = num_episodes
+    args.num_episodes = trials_per_variation
     args.gripper_loc_bounds_file = gripper_loc_bounds_file
     args.use_instruction = use_instruction
     args.max_tries = max_tries
@@ -183,9 +178,8 @@ def _setup_worker():
                 if not variations:
                     logger.warning(f"No variations found for task {task} in {data_dir}")
                     continue
-                demos_per_var = distribute_episodes(num_episodes, variations)
                 for var in variations:
-                    items.append((task, var, demos_per_var[var]))
+                    items.append((task, var, trials_per_variation))
 
             if not items:
                 logger.error(f"No (task, variation) items found for {experiment_id}; skipping")
