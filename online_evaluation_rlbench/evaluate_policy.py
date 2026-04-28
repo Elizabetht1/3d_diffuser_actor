@@ -19,7 +19,7 @@ from utils.common_utils import (
     round_floats
 )
 from lpwm_dev.rlbench_utils.geometry import get_gripper_loc_bounds
-from utils.utils_with_rlbench import RLBenchEnv, Actioner, load_episodes, Actioner_Coparticle
+from utils.utils_with_rlbench import RLBenchEnv, Actioner, load_episodes, Actioner_Coparticle, task_file_to_task_class
 from lpwm_dev.model_factory import build_model 
 from lpwm_dev.rlbench_utils.normalization import EefActionNormalizer
 from datetime import datetime
@@ -289,6 +289,83 @@ def main_coparticle(args=None):
             json.dump(round_floats(task_success_rates), f, indent=4)
         
     return task_success_rates, out_root
+
+
+def evaluate_single_variation(args, task_str: str, variation: int, n_demos: int, device: str, result_queue):
+    """Evaluate one (task, variation) pair. Runs in a spawned subprocess."""
+    args.device = device
+    os.environ['DISPLAY'] = ':1'
+
+    log_run = datetime.now().strftime("%m:%d:%Y_%I:%M.%f_%p")
+    os.makedirs(os.path.join(Path(__file__).parent.parent, 'eval_logs', log_run), exist_ok=True)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    env = RLBenchEnv(
+        data_path=args.data_dir,
+        image_size=[int(x) for x in args.image_size.split(",")],
+        apply_rgb=True,
+        apply_pc=True,
+        headless=bool(args.headless),
+        apply_cameras=args.cameras,
+        collision_checking=bool(args.collision_checking),
+    )
+
+    model = build_model(config_path=args.config, device_override=args.device)
+    state_dict = torch.load(args.checkpoint, map_location=torch.device('cpu'))
+    state_dict = {(k[len('module.'):] if k.startswith('module.') else k): v for k, v in state_dict.items()}
+    try:
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        print(e)
+        result_queue.put(None)
+        return
+
+    with open(args.config, 'r') as fin:
+        config = json.load(fin)
+
+    normalizer = EefActionNormalizer(
+        tasks_bounds_file=args.gripper_loc_bounds_file,
+        tasks=args.tasks,
+        task_bounds_buffer=args.gripper_loc_bounds_buffer,
+    )
+    actioner = Actioner_Coparticle(
+        policy=model,
+        apply_cameras=args.cameras,
+        action_dim=args.action_dim,
+        convert_6D=config['convert_6D'],
+        num_pred_steps=config['timestep_horizon'],
+        cond_steps=config['cond_steps'],
+        deterministic=True,
+        max_length=config['language_max_len'],
+        normalizer=normalizer,
+        gripper_loc_bounds=None,
+        embed_type=args.embed_type,
+        use_lang_mask=config.get('use_lang_mask', False),
+        model_max_length=config.get('language_max_len', 53),
+    )
+
+    max_eps_dict = load_episodes()["max_episode_length"]
+    max_steps = max_eps_dict[task_str] if args.max_steps == -1 else args.max_steps
+
+    success_rate, valid, num_valid_demos = env.evaluate_one_variation(
+        task_str=task_str,
+        variation=variation,
+        max_steps=max_steps,
+        num_demos=n_demos,
+        actioner=actioner,
+        max_tries=args.max_tries,
+        dense_interpolation=bool(args.dense_interpolation),
+        interpolation_length=args.interpolation_length,
+        verbose=bool(args.verbose),
+        num_history=args.num_history,
+        verify=bool(args.verify),
+        log_run=log_run,
+    )
+
+    result_queue.put({'success_rate': success_rate, 'num_valid_demos': num_valid_demos} if valid else None)
 
 
 def main_3ddfa():

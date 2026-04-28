@@ -742,7 +742,47 @@ class RLBenchEnv:
         var_success_rates['verification'] = verifier_success_rates
 
         return var_success_rates
-    
+
+    def evaluate_one_variation(
+        self,
+        task_str: str,
+        variation: int,
+        max_steps: int,
+        num_demos: int,
+        actioner,
+        max_tries: int = 1,
+        verbose: bool = False,
+        dense_interpolation: bool = False,
+        interpolation_length: int = 100,
+        num_history: int = 1,
+        verify: bool = False,
+        log_run=None,
+    ):
+        """Run evaluation for a single (task, variation) pair."""
+        self.env.launch()
+        try:
+            task_type = task_file_to_task_class(task_str)
+            task = self.env.get_task(task_type)
+            task.set_variation(variation)
+            success_rate, valid, num_valid_demos, _ = self._evaluate_task_on_one_variation(
+                task_str=task_str,
+                task=task,
+                max_steps=max_steps,
+                variation=variation,
+                num_demos=num_demos,
+                actioner=actioner,
+                max_tries=max_tries,
+                verbose=verbose,
+                dense_interpolation=dense_interpolation,
+                interpolation_length=interpolation_length,
+                num_history=num_history,
+                verify=verify,
+                log_run=log_run,
+            )
+        finally:
+            self.env.shutdown()
+        return success_rate, valid, num_valid_demos
+
     def _get_gt_data(
         self,
         demo,
